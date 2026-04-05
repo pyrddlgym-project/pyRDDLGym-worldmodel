@@ -1,0 +1,367 @@
+import math
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+
+class AbsolutePositionalEncoding(nn.Module):
+    '''Implements absolute positional encoding as described in "Attention is All You Need".'''
+
+    def __init__(self, d_model: int, max_len: int=256, dropout: float=0.1) -> None:
+        super().__init__()
+
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)   # (max_len, 1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))  # (d_model / 2,)
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:x.size(1)]   # (batch, seq_len, d_model)
+        return self.dropout(x)
+
+
+class EMA:
+    '''Maintains an exponential moving average of model weights for evaluation stability.'''
+
+    def __init__(self, model: nn.Module, decay: float=0.995) -> None:
+        self.decay = decay
+        self.weights = {k: v.clone().float().cpu() for k, v in model.state_dict().items()}
+        self.device = next(model.parameters()).device
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            self.weights[k].mul_(self.decay).add_(v.float().cpu(), alpha=1 - self.decay)
+
+    @property
+    def state_dict(self) -> dict:
+        return {k: v.to(self.device) for k, v in self.weights.items()}
+
+
+class WorldModel(nn.Module):
+    '''A transformer-based world model that predicts the next state given a sequence of 
+    past states and actions.'''
+
+    def __init__(self, state_dim: int, action_dim: int, seq_len: int,
+                 d_model: int=64, nhead: int=4, num_layers: int=4, 
+                 dim_feedforward: int=256, dropout: float=0.1, 
+                 use_linear_proj: bool=True, norm_first: bool=True) -> None:
+        super().__init__()
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.seq_len = seq_len
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.use_linear_proj = use_linear_proj
+        self.norm_first = norm_first
+
+        # state -> (d_model,) embedding
+        if use_linear_proj:
+            self.input_proj = nn.Linear(state_dim + action_dim, d_model)
+        else:
+            self.d_model = d_model = state_dim + action_dim
+            self.input_proj = nn.Identity()
+
+        # Keep input feature scaling stable regardless of transformer norm mode
+        self.input_norm = nn.LayerNorm(d_model)
+
+        # learnable special tokens in embedding space
+        self.pad_token = nn.Parameter(torch.zeros(d_model))
+        self.sos_token = nn.Parameter(torch.zeros(d_model))
+
+        # absolute positional encoding
+        self.pe = AbsolutePositionalEncoding(d_model, max_len=seq_len, dropout=dropout)
+
+        # transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=norm_first,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
+
+        # pre-norm stacks typically need a final normalization on the encoder output
+        self.output_norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
+        
+        # (d_model,) embedding -> next state prediction
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, state_dim),
+        )
+
+        # Huber loss for stable regression training
+        self.loss_fn = nn.HuberLoss()
+
+        # placeholder normalizer buffers
+        self.register_buffer("state_mean", torch.zeros(state_dim))
+        self.register_buffer("state_std", torch.ones(state_dim))
+        self.register_buffer("action_mean", torch.zeros(action_dim))
+        self.register_buffer("action_std", torch.ones(action_dim))
+        self.register_buffer("obs_idx", torch.arange(state_dim, dtype=torch.long))
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def set_dataset_stats(self, dataset):
+        self.register_buffer("state_mean", dataset.state_mean.to(self.device))
+        self.register_buffer("state_std", dataset.state_std.to(self.device))
+        self.register_buffer("action_mean", dataset.action_mean.to(self.device))
+        self.register_buffer("action_std", dataset.action_std.to(self.device))
+        if dataset.obs_idx is None:
+            obs_idx = torch.arange(self.state_dim, dtype=torch.long, device=self.device)
+        else:
+            obs_idx = torch.tensor(dataset.obs_idx, dtype=torch.long, device=self.device)
+        self.register_buffer("obs_idx", obs_idx)
+
+    # <----------------------------------- prediction ----------------------------------->
+
+    def forward(self, x: torch.Tensor, pad_lens: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(x)  # (batch, seq_len, d_model)
+        x = self.input_norm(x)
+
+        # replace padded positions with learnable PAD embedding
+        batch, seq_len = x.shape[:2]
+        pad_mask = self.make_padding_mask(pad_lens, seq_len)  # (batch, seq_len)
+        x = x.clone()
+        x[pad_mask] = self.pad_token
+        
+        # mark first timestep with a learnable SOS embedding
+        x[:, 0] = x[:, 0] + self.sos_token
+
+        # positional encoding and transformer
+        x = self.pe(x)
+        mask = self.make_full_mask(pad_lens, seq_len, batch)
+        x = self.transformer(x, mask=mask)
+
+        # get last real output before padding
+        x = self.output_norm(x)
+        last_real_idx = (seq_len - pad_lens - 1).clamp(min=0)
+        batch_idx = torch.arange(batch, device=self.device)
+        x = x[batch_idx, last_real_idx]    
+        return self.output_proj(x)
+
+    def make_padding_mask(self, pad_lens: torch.Tensor, seq_len: int) -> torch.Tensor:
+        pos = torch.arange(seq_len, device=self.device)  # (seq_len,)
+        return pos.unsqueeze(0) >= (seq_len - pad_lens).unsqueeze(1)  # (batch, seq_len)
+    
+    def make_full_mask(self, pad_lens: torch.Tensor, seq_len: int, batch: int) -> torch.Tensor:
+
+        # create causal mask
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_len, device=self.device)
+
+        # add padding mask to causal mask
+        pad_mask_ = self.make_padding_mask(pad_lens, seq_len)   # (batch, seq_len)
+        padding_mask = torch.zeros(batch, 1, seq_len, device=self.device)
+        padding_mask = padding_mask.masked_fill(pad_mask_.unsqueeze(1), float('-inf'))
+        mask = causal_mask.unsqueeze(0) + padding_mask   # (batch, seq_len, seq_len)
+
+        # ensure padded positions can attend to themselves to prevent NaNs in attention output
+        eye = torch.eye(seq_len, dtype=torch.bool, device=self.device)
+        mask = mask.masked_fill(pad_mask_.unsqueeze(-1) & eye, 0.0)
+        mask = mask.unsqueeze(1).expand(-1, self.nhead, -1, -1)
+        mask = mask.reshape(batch * self.nhead, seq_len, seq_len)
+        return mask
+
+    def make_inputs(self, states, actions):
+        states = (states - self.state_mean) / self.state_std
+        actions = (actions - self.action_mean) / self.action_std
+        return torch.cat([states, actions], dim=-1)
+    
+    # <---------------------------- training and evaluation ----------------------------->
+
+    def loss(self, states, actions, next_states, pad_lens):
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        next_states = next_states.to(self.device)
+        pad_lens = pad_lens.to(self.device)
+        
+        targets = (next_states - self.state_mean) / self.state_std
+        x = self.make_inputs(states, actions)
+        pred = self.forward(x, pad_lens)
+        return self.loss_fn(pred, targets)
+    
+    @torch.no_grad()
+    def evaluate(self, data_loader):
+        self.eval()
+        
+        if data_loader is None: 
+            return None
+
+        loss = 0.
+        for states, actions, *_, next_states, pad_lens in tqdm(data_loader, desc="Evaluating"):
+            loss += self.loss(states, actions, next_states, pad_lens).item()
+        return loss / len(data_loader)
+
+    def fit(self, train_data_loader, epochs: int, lr: float=1e-3, lr_decay: float=0.9, 
+            test_data_loader=None, path: str=None) -> None:
+                
+        optim = torch.optim.Adam(self.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim, factor=lr_decay, patience=10, min_lr=1e-5)
+        
+        ema = EMA(self)
+
+        self.set_dataset_stats(train_data_loader.dataset.dataset)
+
+        for epoch in range(epochs):
+            self.train()
+
+            # training loop
+            epoch_loss = 0.
+            for states, actions, *_, next_states, pad_lens in tqdm(
+                    train_data_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+                loss = self.loss(states, actions, next_states, pad_lens)
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+                ema.update(self)
+                epoch_loss += loss.item()
+            avg_loss = epoch_loss / len(train_data_loader)
+            scheduler.step(avg_loss)
+
+            # evaluation with EMA weights
+            train_state = {k: v.clone() for k, v in self.state_dict().items()}
+            self.load_state_dict(ema.state_dict)
+            test_loss = self.evaluate(test_data_loader)
+            current_lr = optim.param_groups[0]['lr']
+            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_loss:.6f}, "
+                  f"Test Loss: {test_loss:.6f}, LR: {current_lr:.2e}")
+            self.load_state_dict(train_state)
+        
+        # save the EMA weights as the final model
+        self.load_state_dict(ema.state_dict)
+
+        if path is not None:
+            self.save(path)
+
+    # <---------------------------- loading and saving ----------------------------->
+
+    def _config(self):
+        return {
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "seq_len": self.seq_len,
+            "d_model": self.d_model,
+            "nhead": self.nhead,
+            "num_layers": self.num_layers,
+            "dim_feedforward": self.dim_feedforward,
+            "dropout": self.dropout,
+            "use_linear_proj": self.use_linear_proj,
+            "norm_first": self.norm_first,
+        }
+
+    def save(self, path: str) -> None:
+        checkpoint = {
+            "config": self._config(),
+            "state_dict": self.state_dict(),
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load(cls, path: str, map_location: str="cuda") -> "WorldModel":
+        checkpoint = torch.load(path, map_location=map_location)
+        config = checkpoint["config"]
+        state_dict = checkpoint["state_dict"]
+        
+        model = cls(**config)
+        model.load_state_dict(state_dict)
+        model.eval()
+        return model
+    
+
+class RolloutContext:
+    ''''Context manager for performing rollouts with a world model. 
+    Maintains a sliding window of past states and actions to feed into the model for 
+    next state prediction.'''
+
+    def __init__(self, model: WorldModel) -> None:
+        self.model = model
+        self.device = model.device
+        self.seq_len = model.seq_len
+
+    def make_padded(self, x, req_len):
+        batch, seq_len, state_dim = x.shape
+        x = x.to(self.device).clone()
+        if seq_len >= req_len:
+            return x[:, -req_len:, :]
+        pad_len = req_len - seq_len
+        padding = torch.zeros(batch, pad_len, state_dim, device=self.device)
+        return torch.cat([x, padding], dim=1)
+    
+    @torch.no_grad()
+    def reset(self, init_states: torch.Tensor, init_actions: torch.Tensor) -> None:
+        batch, init_len = init_states.shape[:2]
+        self.states = self.make_padded(init_states, self.seq_len)
+        self.actions = self.make_padded(init_actions, self.seq_len)
+        init_pad = max(0, self.seq_len - init_len)
+        self.pad_lens = torch.full((batch,), init_pad, dtype=torch.long, device=self.device)
+
+    @torch.no_grad()
+    def step(self, actions: torch.Tensor) -> torch.Tensor:
+        self.model.eval()
+
+        # set actions at the last real token position for each batch item
+        last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
+        batch = self.states.size(0)
+        batch_idx = torch.arange(batch, device=self.device)
+        self.actions[batch_idx, last_real_idx] = actions
+
+        # predict next state using the model
+        x = self.model.make_inputs(self.states, self.actions)
+        pred = self.model.forward(x, self.pad_lens)
+        next_state = pred * self.model.state_std + self.model.state_mean
+
+        # for indices with padding, write next index directly into the buffer
+        has_pad = self.pad_lens > 0
+        if torch.any(has_pad):
+            append_idx = last_real_idx[has_pad] + 1
+            self.states[has_pad, append_idx] = next_state[has_pad]
+        
+        # for indices without padding, shift left and append at the end
+        if torch.any(~has_pad):
+            self.states[~has_pad] = torch.roll(self.states[~has_pad], -1, dims=1)
+            self.states[~has_pad, -1] = next_state[~has_pad]
+            self.actions[~has_pad] = torch.roll(self.actions[~has_pad], -1, dims=1)
+        
+        self.pad_lens = (self.pad_lens - 1).clamp(min=0)
+
+        return next_state
+    
+    @torch.no_grad()
+    def rollout(self, init_states: torch.Tensor, init_actions: torch.Tensor, 
+                vec_policy, max_steps: int) -> torch.Tensor:
+        device = self.device
+        
+        # reset rollout context with initial state from environment
+        init_states = init_states.to(device)[:, :, self.model.obs_idx]
+        init_actions = init_actions.to(device)
+        self.reset(init_states, init_actions)
+                   
+        # perform rollout using policy and model
+        trajectories = []
+        for _ in tqdm(range(max_steps), desc="Rollout"):
+            last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
+            batch = self.states.size(0)
+            batch_idx = torch.arange(batch, device=device)
+            last_states = self.states[batch_idx, last_real_idx].detach().cpu().numpy()
+            actions = torch.tensor(vec_policy(last_states), dtype=torch.float32, device=device)
+            states = self.step(actions)
+            trajectories.append(states)
+
+        return torch.stack(trajectories).permute(1, 0, 2)
+    
