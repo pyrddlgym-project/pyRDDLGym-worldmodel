@@ -1,7 +1,13 @@
 import math
+import os
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+from typing import Any, Dict
+
+
+PARENT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+MODEL_PATH = os.path.join(PARENT_PATH, "models")
 
 
 class AbsolutePositionalEncoding(nn.Module):
@@ -35,10 +41,10 @@ class EMA:
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
         for k, v in model.state_dict().items():
-            self.weights[k].mul_(self.decay).add_(v.float().cpu(), alpha=1 - self.decay)
+            self.weights[k].mul_(self.decay).add_(v.float().cpu(), alpha=1. - self.decay)
 
     @property
-    def state_dict(self) -> dict:
+    def state_dict(self) -> Dict[str, torch.Tensor]:
         return {k: v.to(self.device) for k, v in self.weights.items()}
 
 
@@ -116,15 +122,15 @@ class WorldModel(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def set_dataset_stats(self, dataset):
+    def set_dataset_stats(self, dataset) -> None:
         self.register_buffer("state_mean", dataset.state_mean.to(self.device))
         self.register_buffer("state_std", dataset.state_std.to(self.device))
         self.register_buffer("action_mean", dataset.action_mean.to(self.device))
         self.register_buffer("action_std", dataset.action_std.to(self.device))
-        if dataset.obs_idx is None:
-            obs_idx = torch.arange(self.state_dim, dtype=torch.long, device=self.device)
-        else:
+        if dataset.obs_idx is not None:
             obs_idx = torch.tensor(dataset.obs_idx, dtype=torch.long, device=self.device)
+        else:
+            obs_idx = None
         self.register_buffer("obs_idx", obs_idx)
 
     # <----------------------------------- prediction ----------------------------------->
@@ -177,14 +183,15 @@ class WorldModel(nn.Module):
         mask = mask.reshape(batch * self.nhead, seq_len, seq_len)
         return mask
 
-    def make_inputs(self, states, actions):
+    def make_inputs(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         states = (states - self.state_mean) / self.state_std
         actions = (actions - self.action_mean) / self.action_std
         return torch.cat([states, actions], dim=-1)
     
     # <---------------------------- training and evaluation ----------------------------->
 
-    def loss(self, states, actions, next_states, pad_lens):
+    def loss(self, states: torch.Tensor, actions: torch.Tensor, next_states: torch.Tensor, 
+             pad_lens: torch.Tensor) -> torch.Tensor:
         states = states.to(self.device)
         actions = actions.to(self.device)
         next_states = next_states.to(self.device)
@@ -196,11 +203,11 @@ class WorldModel(nn.Module):
         return self.loss_fn(pred, targets)
     
     @torch.no_grad()
-    def evaluate(self, data_loader):
+    def evaluate(self, data_loader) -> float:
         self.eval()
         
         if data_loader is None: 
-            return None
+            return float('nan')
 
         loss = 0.
         for states, actions, *_, next_states, pad_lens in tqdm(data_loader, desc="Evaluating"):
@@ -208,7 +215,7 @@ class WorldModel(nn.Module):
         return loss / len(data_loader)
 
     def fit(self, train_data_loader, epochs: int, lr: float=1e-3, lr_decay: float=0.9, 
-            test_data_loader=None, path: str=None) -> None:
+            test_data_loader=None, model_name: str='') -> None:
                 
         self.set_dataset_stats(train_data_loader.dataset)
 
@@ -245,13 +252,12 @@ class WorldModel(nn.Module):
         
         # save the EMA weights as the final model
         self.load_state_dict(ema.state_dict)
-
-        if path is not None:
-            self.save(path)
+        if model_name:
+            self.save(model_name)
 
     # <---------------------------- loading and saving ----------------------------->
 
-    def _config(self):
+    def _config(self) -> Dict[str, Any]:
         return {
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
@@ -265,16 +271,16 @@ class WorldModel(nn.Module):
             "norm_first": self.norm_first,
         }
 
-    def save(self, path: str) -> None:
+    def save(self, model_name: str) -> None:
         checkpoint = {
             "config": self._config(),
             "state_dict": self.state_dict(),
         }
-        torch.save(checkpoint, path)
+        torch.save(checkpoint, os.path.join(MODEL_PATH, model_name))
 
     @classmethod
-    def load(cls, path: str, map_location: str="cuda") -> "WorldModel":
-        checkpoint = torch.load(path, map_location=map_location)
+    def load(cls, model_name: str, device: str="cuda") -> "WorldModel":
+        checkpoint = torch.load(os.path.join(MODEL_PATH, model_name), map_location=device)
         config = checkpoint["config"]
         state_dict = checkpoint["state_dict"]
         
@@ -289,18 +295,18 @@ class RolloutContext:
     Maintains a sliding window of past states and actions to feed into the model for 
     next state prediction.'''
 
-    def __init__(self, model: WorldModel) -> None:
+    def __init__(self, model: "WorldModel") -> None:
         self.model = model
         self.device = model.device
         self.seq_len = model.seq_len
 
-    def make_padded(self, x, req_len):
-        batch, seq_len, state_dim = x.shape
+    def make_padded(self, x: torch.Tensor, req_len: int) -> torch.Tensor:
         x = x.to(self.device).clone()
+        batch, seq_len, *state_shape = x.shape
         if seq_len >= req_len:
-            return x[:, -req_len:, :]
+            return x[:, -req_len:]
         pad_len = req_len - seq_len
-        padding = torch.zeros(batch, pad_len, state_dim, device=self.device)
+        padding = torch.zeros(batch, pad_len, *state_shape, device=self.device)
         return torch.cat([x, padding], dim=1)
     
     @torch.no_grad()
@@ -317,8 +323,7 @@ class RolloutContext:
 
         # set actions at the last real token position for each batch item
         last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
-        batch = self.states.size(0)
-        batch_idx = torch.arange(batch, device=self.device)
+        batch_idx = torch.arange(actions.size(0), device=self.device)
         self.actions[batch_idx, last_real_idx] = actions
 
         # predict next state using the model
@@ -348,16 +353,17 @@ class RolloutContext:
         device = self.device
         
         # reset rollout context with initial state from environment
-        init_states = init_states.to(device)[:, :, self.model.obs_idx]
+        init_states = init_states.to(device)
         init_actions = init_actions.to(device)
+        if self.model.obs_idx is not None:
+            init_states = init_states[:, :, self.model.obs_idx]
         self.reset(init_states, init_actions)
                    
         # perform rollout using policy and model
         trajectories = []
         for _ in tqdm(range(max_steps), desc="Rollout"):
             last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
-            batch = self.states.size(0)
-            batch_idx = torch.arange(batch, device=device)
+            batch_idx = torch.arange(self.states.size(0), device=device)
             last_states = self.states[batch_idx, last_real_idx].detach().cpu().numpy()
             actions = torch.tensor(vec_policy(last_states), dtype=torch.float32, device=device)
             states = self.step(actions)

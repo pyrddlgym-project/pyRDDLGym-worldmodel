@@ -1,15 +1,25 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 import pickle
 import random
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from typing import Callable, Dict, Generator, Tuple
+
+Array = np.ndarray
+ArrayDict = Dict[str, Array]
+
+
+PARENT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DATA_PATH = os.path.join(PARENT_PATH, 'data')
+PLOTS_PATH = os.path.join(PARENT_PATH, 'plots')
 
 
 # <------------------------------- Data collection  ------------------------------>
 
-def to_tensor(state_dict):
+def to_tensor(state_dict: ArrayDict) -> Array:
     state_vec = []
     for value in state_dict.values():
         value = np.asarray(value, dtype=np.float32)
@@ -17,17 +27,20 @@ def to_tensor(state_dict):
     return np.concatenate(state_vec)
 
 
-def to_state_dict(state_vec, state_keys):
+def to_state_dict(state_vec: Array, state_keys: Array) -> ArrayDict:
     return dict(zip(state_keys, state_vec))
 
 
-def create_data(env, policy, episodes, max_steps, save_path, 
-                state_map=to_tensor, action_map=to_tensor, render=False):
+def create_data(env, policy, episodes: int, max_steps: int, data_name: str, 
+                state_map: Callable[[ArrayDict], Array]=to_tensor, 
+                action_map: Callable[[ArrayDict], Array]=to_tensor, 
+                render: bool=False) -> None:
     episodes = int(episodes)
     max_steps = int(max_steps)
 
     # collect data
     states, actions, rewards, dones, next_states = [], [], [], [], []
+    
     for _ in (pbar := tqdm(range(episodes), desc="Collecting data")):
         state, _ = env.reset()
         total_reward = 0.
@@ -57,14 +70,14 @@ def create_data(env, policy, episodes, max_steps, save_path,
         "next_states": np.array(next_states),
     }
     
-    with open(save_path, "wb") as f:
+    with open(os.path.join(DATA_PATH, data_name), "wb") as f:
         pickle.dump(data, f)
 
 
 # <------------------------------- Data preparation  ------------------------------>
 
-def load_and_episode_split_data(data_path):
-    with open(data_path, "rb") as f:
+def load_episodic_data(data_name: str) -> Generator[ArrayDict, None, None]:
+    with open(os.path.join(DATA_PATH, data_name), "rb") as f:
         data = pickle.load(f)
 
     # find episode boundaries based on dones
@@ -89,14 +102,10 @@ def load_and_episode_split_data(data_path):
         }
 
 
-def load_episodes(data_path):
-    return list(load_and_episode_split_data(data_path))
-
-
 class SequenceDataset(torch.utils.data.Dataset):
 
     def __init__(self, episodes, seq_len: int, obs_idx=None,
-                 augment_starts: bool=False, min_frames: int=2):
+                 augment_starts: bool=False, min_frames: int=2) -> None:
         self.augment_starts = augment_starts
         self.min_frames = max(1, int(min_frames))
 
@@ -126,18 +135,18 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.pad_lens = torch.tensor(sequences["pad_lens"], dtype=torch.long)
 
         # compute state normalization stats
-        self.state_mean = self.next_states.mean(dim=0)   # (state_dim,)
+        self.state_mean = self.next_states.mean(dim=0)   # (state_dim...)
         self.state_std = self.next_states.std(dim=0).clamp(min=1e-8)
         
         # compute action normalization stats
-        N, T = self.actions.shape[:2]
-        non_pad_idx = (T - self.pad_lens - 1).clamp(min=0)
-        a_last = self.actions[torch.arange(N), non_pad_idx]
+        batch, act_len = self.actions.shape[:2]
+        non_pad_idx = (act_len - self.pad_lens - 1).clamp(min=0)
+        a_last = self.actions[torch.arange(batch), non_pad_idx]
         self.action_mean = a_last.mean(dim=0)   # (action_dim,)
         self.action_std = a_last.std(dim=0).clamp(min=1e-8)
 
     @staticmethod
-    def make_padded(x, t, seq_len):
+    def make_padded(x: Array, t: int, seq_len: int) -> Tuple[Array, int]:
         start = max(0, t - seq_len + 1)
         hist = x[start:t + 1]
         pad_len = seq_len - hist.shape[0]
@@ -146,36 +155,37 @@ class SequenceDataset(torch.utils.data.Dataset):
         return new_x, pad_len
 
     @staticmethod
-    def load_and_episode_split_pad_data(episodes, seq_len: int) -> dict:
+    def load_and_episode_split_pad_data(episodes, seq_len: int) -> ArrayDict:
 
         states, actions, rewards, dones, next_states, pad_lens = [], [], [], [], [], []
         
         for eps_data in episodes:
             
             for t in range(eps_data['len']):
-                s_win, pad = SequenceDataset.make_padded(eps_data['states'], t, seq_len)
-                a_win, _ = SequenceDataset.make_padded(eps_data['actions'], t, seq_len)
-                r_win, _ = SequenceDataset.make_padded(eps_data['rewards'], t, seq_len)
-                d_win, _ = SequenceDataset.make_padded(eps_data['dones'], t, seq_len)
+                states_w, pad = SequenceDataset.make_padded(eps_data['states'], t, seq_len)
+                actions_w, _ = SequenceDataset.make_padded(eps_data['actions'], t, seq_len)
+                rewards_w, _ = SequenceDataset.make_padded(eps_data['rewards'], t, seq_len)
+                dones_w, _ = SequenceDataset.make_padded(eps_data['dones'], t, seq_len)
+                next_states_t = eps_data['next_states'][t]
 
-                states.append(s_win)
-                actions.append(a_win)
-                rewards.append(r_win)
-                dones.append(d_win)
-                next_states.append(eps_data['next_states'][t])
+                states.append(states_w)
+                actions.append(actions_w)
+                rewards.append(rewards_w)
+                dones.append(dones_w)
+                next_states.append(next_states_t)
                 pad_lens.append(pad)
 
         return {
-            "states":      np.stack(states),       # (T_total, seq_len, state_dim)
+            "states":      np.stack(states),       # (T_total, seq_len, state_dim...)
             "actions":     np.stack(actions),      # (T_total, seq_len, action_dim)
             "rewards":     np.stack(rewards),      # (T_total, seq_len)
             "dones":       np.stack(dones),        # (T_total, seq_len)
-            "next_states": np.stack(next_states),  # (T_total, state_dim)
+            "next_states": np.stack(next_states),  # (T_total, state_dim...)
             "pad_lens":    np.stack(pad_lens),     # (T_total,)
         }
 
     @staticmethod
-    def increase_padding(x, old_pad, new_pad):
+    def increase_padding(x: torch.Tensor, old_pad: int, new_pad: int) -> torch.Tensor:
         seq_len = x.shape[0]
         old_real = seq_len - old_pad
         new_real = seq_len - new_pad
@@ -183,10 +193,10 @@ class SequenceDataset(torch.utils.data.Dataset):
         y[:new_real] = x[old_real - new_real:old_real]
         return y
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.states)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         states = self.states[idx]
         actions = self.actions[idx]
         rewards = self.rewards[idx]
@@ -208,29 +218,28 @@ class SequenceDataset(torch.utils.data.Dataset):
                 pad_lens = torch.tensor(new_pad, dtype=torch.long)
 
         return (
-            states,          # (context_len, state_dim)
-            actions,         # (context_len, action_dim)
+            states,          # (context_len, state_dim...)
+            actions,         # (context_len, action_dim,)
             rewards,         # (context_len,)
             dones,           # (context_len,)
-            next_states,     # (state_dim,)
+            next_states,     # (state_dim...)
             pad_lens,        # (,)
         )
     
 
-def get_dataloader(data_path, context_len, batch_size=64, test_split=0.1, seed=0, 
-                   **dataset_kwargs):
-    episodes = list(load_and_episode_split_data(data_path))
+def get_dataloader(data_name: str, seq_len: int, batch_size: int=64, test_split: float=0.1, 
+                   seed: int=0, **dataset_kwargs):
+    episodes = list(load_episodic_data(data_name))
     n_episodes = len(episodes)
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n_episodes)
-
     n_test = min(max(1, int(round(test_split * n_episodes))), n_episodes - 1)
-
     train_eps = [episodes[i] for i in perm[n_test:]]
     test_eps = [episodes[i] for i in perm[:n_test]]
-    train_set = SequenceDataset(train_eps, context_len, **dataset_kwargs)
-    test_set = SequenceDataset(test_eps, context_len, **dataset_kwargs)
+
+    train_set = SequenceDataset(train_eps, seq_len, **dataset_kwargs)
+    test_set = SequenceDataset(test_eps, seq_len, **dataset_kwargs)
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=True)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, pin_memory=True)
@@ -239,7 +248,7 @@ def get_dataloader(data_path, context_len, batch_size=64, test_split=0.1, seed=0
 
 # <------------------------------- Data visualization  ------------------------------>
 
-def plot_trajectories(trajectories, save_path):
+def plot_trajectories(trajectories, plot_name: str) -> None:
     if isinstance(trajectories, torch.Tensor):
         trajectories = trajectories.detach().cpu().numpy()
 
@@ -248,18 +257,18 @@ def plot_trajectories(trajectories, save_path):
     for traj in trajectories:
         for j in range(n_states):
             axs[0, j].plot(traj[:, j])
-    plt.savefig(save_path)
+    plt.savefig(os.path.join(PLOTS_PATH, plot_name))
     plt.close(fig)
 
 
-def plot_data_trajectories(data_path, limit, save_path):
-    episode_data = list(load_and_episode_split_data(data_path))
+def plot_data_trajectories(data_name: str, limit: int, plot_name: str) -> None:
+    episode_data = list(load_episodic_data(data_name))
     random.shuffle(episode_data)
     trajectories = [episode_data[i]['states'] for i in range(limit)]
-    plot_trajectories(trajectories, save_path)
+    plot_trajectories(trajectories, plot_name)
 
 
-def save_video(state_keys, viz, trajectories, save_path):
+def save_video(state_keys, viz, trajectories, plot_name: str) -> None:
     if isinstance(trajectories, torch.Tensor):
         trajectories = trajectories.detach().cpu().numpy()
     
@@ -269,5 +278,7 @@ def save_video(state_keys, viz, trajectories, save_path):
             state_dict = to_state_dict(state, state_keys)
             image = viz.render(state_dict)
             frames.append(image)
+
     frames[0].save(
-        fp=save_path, format='GIF', append_images=frames, save_all=True, duration=100)
+        fp=os.path.join(PLOTS_PATH, plot_name), 
+        format='GIF', append_images=frames, save_all=True, duration=100)

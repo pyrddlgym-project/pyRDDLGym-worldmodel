@@ -3,9 +3,9 @@ import torch
 import pyRDDLGym
 from pyRDDLGym.core.policy import BaseAgent
 
-from .data import create_data, get_dataloader, to_tensor, \
+from twm.core.data import create_data, get_dataloader, to_tensor, \
     plot_data_trajectories, plot_trajectories, save_video
-from .model import RolloutContext, WorldModel
+from twm.core.model import RolloutContext, WorldModel
 
 
 class PongEnvWithRandomStarts:
@@ -81,7 +81,7 @@ def plot_model_rollouts(model, batch_size=4):
     
     state_keys = ['ball-x___b1', 'ball-y___b1', 'paddle-y']
     plot_data_trajectories('pong_data.pkl', batch_size, 'pong_data_rollouts.png')
-    plot_trajectories(trajectories, save_path='pong_model_rollouts.png')
+    plot_trajectories(trajectories, 'pong_model_rollouts.png')
     save_video(state_keys, env._visualizer, trajectories, 'pong_model_rollout.gif')
 
 
@@ -92,12 +92,12 @@ if __name__ == "__main__":
 
     if fit:
         train_loader, test_loader = get_dataloader(
-            'pong_data.pkl', seq_len, batch_size=64, obs_idx=[0, 1, 4], augment_starts=False)
+            'pong_data.pkl', seq_len, batch_size=64, obs_idx=[0, 1, 4], augment_starts=True)
         state_dim = train_loader.dataset.state_dim
         action_dim = train_loader.dataset.action_dim
    
         model = WorldModel(state_dim, action_dim, seq_len).to('cuda')
-        model.fit(train_loader, epochs=600, test_data_loader=test_loader, path='pong_world_model.pth')
+        model.fit(train_loader, epochs=600, test_data_loader=test_loader, model_name='pong_world_model.pth')
     
     else:
         model = WorldModel.load('pong_world_model.pth').to('cuda')
