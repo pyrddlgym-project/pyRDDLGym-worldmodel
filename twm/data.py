@@ -22,7 +22,7 @@ def to_state_dict(state_vec, state_keys):
 
 
 def create_data(env, policy, episodes, max_steps, save_path, 
-                state_map=to_tensor, action_map=to_tensor):
+                state_map=to_tensor, action_map=to_tensor, render=False):
     episodes = int(episodes)
     max_steps = int(max_steps)
 
@@ -32,7 +32,8 @@ def create_data(env, policy, episodes, max_steps, save_path,
         state, _ = env.reset()
         total_reward = 0.
         for step in range(max_steps):
-            env.render()
+            if render:
+                env.render()
             action = policy.sample_action(state)
             next_state, reward, term, trunc, _ = env.step(action)
             total_reward += reward
@@ -88,15 +89,19 @@ def load_and_episode_split_data(data_path):
         }
 
 
+def load_episodes(data_path):
+    return list(load_and_episode_split_data(data_path))
+
+
 class SequenceDataset(torch.utils.data.Dataset):
 
-    def __init__(self, data_path: str, seq_len: int, obs_idx=None, 
+    def __init__(self, episodes, seq_len: int, obs_idx=None,
                  augment_starts: bool=False, min_frames: int=2):
         self.augment_starts = augment_starts
         self.min_frames = max(1, int(min_frames))
 
         # create episode data but with padding
-        sequences = self.load_and_episode_split_pad_data(data_path, seq_len)
+        sequences = self.load_and_episode_split_pad_data(episodes, seq_len)
         
         # filter observed components of state
         states = sequences["states"]
@@ -141,11 +146,11 @@ class SequenceDataset(torch.utils.data.Dataset):
         return new_x, pad_len
 
     @staticmethod
-    def load_and_episode_split_pad_data(data_path: str, seq_len: int) -> dict:
+    def load_and_episode_split_pad_data(episodes, seq_len: int) -> dict:
 
         states, actions, rewards, dones, next_states, pad_lens = [], [], [], [], [], []
         
-        for eps_data in load_and_episode_split_data(data_path):
+        for eps_data in episodes:
             
             for t in range(eps_data['len']):
                 s_win, pad = SequenceDataset.make_padded(eps_data['states'], t, seq_len)
@@ -212,9 +217,21 @@ class SequenceDataset(torch.utils.data.Dataset):
         )
     
 
-def get_dataloader(data_path, context_len, batch_size=64, test_split=0.1, **dataset_kwargs):
-    dataset = SequenceDataset(data_path, context_len, **dataset_kwargs)
-    train_set, test_set = random_split(dataset, [1. - test_split, test_split])
+def get_dataloader(data_path, context_len, batch_size=64, test_split=0.1, seed=0, 
+                   **dataset_kwargs):
+    episodes = list(load_and_episode_split_data(data_path))
+    n_episodes = len(episodes)
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_episodes)
+
+    n_test = min(max(1, int(round(test_split * n_episodes))), n_episodes - 1)
+
+    train_eps = [episodes[i] for i in perm[n_test:]]
+    test_eps = [episodes[i] for i in perm[:n_test]]
+    train_set = SequenceDataset(train_eps, context_len, **dataset_kwargs)
+    test_set = SequenceDataset(test_eps, context_len, **dataset_kwargs)
+
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=True)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, pin_memory=True)
     return train_loader, test_loader

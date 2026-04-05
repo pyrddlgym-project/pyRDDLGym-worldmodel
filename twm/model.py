@@ -210,13 +210,13 @@ class WorldModel(nn.Module):
     def fit(self, train_data_loader, epochs: int, lr: float=1e-3, lr_decay: float=0.9, 
             test_data_loader=None, path: str=None) -> None:
                 
+        self.set_dataset_stats(train_data_loader.dataset)
+
         optim = torch.optim.Adam(self.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optim, factor=lr_decay, patience=10, min_lr=1e-5)
         
         ema = EMA(self)
-
-        self.set_dataset_stats(train_data_loader.dataset.dataset)
 
         for epoch in range(epochs):
             self.train()

@@ -55,7 +55,7 @@ def vec_policy(states):
     return np.array(actions)
 
 
-def create_pong_data(episodes=300, max_steps=200, save_path='pong_data.pkl'):
+def create_pong_data(episodes=200, max_steps=200, save_path='pong_data.pkl'):
     env = PongEnvWithRandomStarts()
     policy = PongPolicy()
     create_data(env, policy, episodes, max_steps, save_path)
@@ -93,11 +93,11 @@ if __name__ == "__main__":
     if fit:
         train_loader, test_loader = get_dataloader(
             'pong_data.pkl', seq_len, batch_size=64, obs_idx=[0, 1, 4], augment_starts=False)
-        state_dim = train_loader.dataset.dataset.state_dim
-        action_dim = train_loader.dataset.dataset.action_dim
+        state_dim = train_loader.dataset.state_dim
+        action_dim = train_loader.dataset.action_dim
    
         model = WorldModel(state_dim, action_dim, seq_len).to('cuda')
-        model.fit(train_loader, epochs=500, test_data_loader=test_loader, path='pong_world_model.pth')
+        model.fit(train_loader, epochs=600, test_data_loader=test_loader, path='pong_world_model.pth')
     
     else:
         model = WorldModel.load('pong_world_model.pth').to('cuda')
