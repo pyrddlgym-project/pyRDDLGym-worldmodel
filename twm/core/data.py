@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pickle
+from PIL import Image
 import random
 import torch
 from torch.utils.data import DataLoader
@@ -19,7 +20,7 @@ PLOTS_PATH = os.path.join(PARENT_PATH, 'plots')
 
 # <------------------------------- Data collection  ------------------------------>
 
-def to_tensor(state_dict: ArrayDict) -> Array:
+def dict_to_tensor(state_dict: ArrayDict) -> Array:
     state_vec = []
     for value in state_dict.values():
         value = np.asarray(value, dtype=np.float32)
@@ -27,14 +28,16 @@ def to_tensor(state_dict: ArrayDict) -> Array:
     return np.concatenate(state_vec)
 
 
-def to_state_dict(state_vec: Array, state_keys: Array) -> ArrayDict:
-    return dict(zip(state_keys, state_vec))
+def image_to_tensor(img: Image.Image, size: Tuple[int, int]=(64, 64)) -> Array:
+    img = img.resize(size, Image.Resampling.BILINEAR)
+    x = np.asarray(img, dtype=np.float16) / 255.0
+    return np.transpose(x, (2, 0, 1))
 
 
-def create_data(env, policy, episodes: int, max_steps: int, data_name: str, 
-                state_map: Callable[[ArrayDict], Array]=to_tensor, 
-                action_map: Callable[[ArrayDict], Array]=to_tensor, 
-                render: bool=False) -> None:
+def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: str, 
+                       state_map: Callable[[ArrayDict], Array]=dict_to_tensor, 
+                       action_map: Callable[[ArrayDict], Array]=dict_to_tensor, 
+                       render: bool=False) -> None:
     episodes = int(episodes)
     max_steps = int(max_steps)
 
@@ -57,6 +60,48 @@ def create_data(env, policy, episodes: int, max_steps: int, data_name: str,
             dones.append(done)
             next_states.append(state_map(next_state))
             state = next_state
+            if done:
+                break
+        pbar.set_postfix({"Episode Reward": total_reward})
+    
+    # save data
+    data = {
+        "states":      np.array(states),
+        "actions":     np.array(actions),
+        "rewards":     np.array(rewards),
+        "dones":       np.array(dones),
+        "next_states": np.array(next_states),
+    }
+    
+    with open(os.path.join(DATA_PATH, data_name), "wb") as f:
+        pickle.dump(data, f)
+
+
+def create_image_data(env, policy, episodes: int, max_steps: int, data_name: str, 
+                      image_map: Callable[[Image.Image], Array]=image_to_tensor, 
+                      action_map: Callable[[ArrayDict], Array]=dict_to_tensor) -> None:
+    episodes = int(episodes)
+    max_steps = int(max_steps)
+
+    # collect data
+    states, actions, rewards, dones, next_states = [], [], [], [], []
+    
+    for _ in (pbar := tqdm(range(episodes), desc="Collecting data")):
+        state, _ = env.reset()
+        obs = image_map(env.render())
+        total_reward = 0.
+        for step in range(max_steps):
+            action = policy.sample_action(state)
+            next_state, reward, term, trunc, _ = env.step(action)
+            next_obs = image_map(env.render())
+            total_reward += reward
+            done = term or trunc or step == max_steps - 1
+            states.append(obs)
+            actions.append(action_map(action))
+            rewards.append(float(reward))
+            dones.append(done)
+            next_states.append(next_obs)
+            state, obs = next_state, next_obs
             if done:
                 break
         pbar.set_postfix({"Episode Reward": total_reward})
@@ -110,29 +155,31 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.min_frames = max(1, int(min_frames))
 
         # create episode data but with padding
-        sequences = self.load_and_episode_split_pad_data(episodes, seq_len)
+        episodes = self.load_and_episode_split_pad_data(episodes, seq_len)
         
         # filter observed components of state
-        states = sequences["states"]
-        next_states = sequences["next_states"]
         if obs_idx is not None:
+            states = episodes["states"]
+            next_states = episodes["next_states"]
             obs_idx = np.array(obs_idx)
             states = np.take(states, obs_idx, axis=2)
             next_states = np.take(next_states, obs_idx, axis=1)
-        sequences["states"] = states
-        sequences["next_states"] = next_states
+            episodes["states"] = states
+            episodes["next_states"] = next_states
         self.obs_idx = obs_idx
         
-        self.state_shape = tuple(sequences["states"].shape[2:])
-        self.state_dim = int(np.prod(self.state_shape, dtype=np.int64))
-        self.action_dim = sequences["actions"].shape[-1]
+        if episodes["states"].ndim > 3:
+            self.state_dim = tuple(episodes["states"].shape[2:])
+        else:
+            self.state_dim = episodes["states"].shape[2]
+        self.action_dim = episodes["actions"].shape[-1]
 
-        self.states = torch.tensor(sequences["states"], dtype=torch.float32)
-        self.actions = torch.tensor(sequences["actions"], dtype=torch.float32)
-        self.rewards = torch.tensor(sequences["rewards"], dtype=torch.float32)
-        self.dones = torch.tensor(sequences["dones"], dtype=torch.bool)
-        self.next_states = torch.tensor(sequences["next_states"], dtype=torch.float32)
-        self.pad_lens = torch.tensor(sequences["pad_lens"], dtype=torch.long)
+        self.states = torch.tensor(episodes["states"], dtype=torch.float32)
+        self.actions = torch.tensor(episodes["actions"], dtype=torch.float32)
+        self.rewards = torch.tensor(episodes["rewards"], dtype=torch.float32)
+        self.dones = torch.tensor(episodes["dones"], dtype=torch.bool)
+        self.next_states = torch.tensor(episodes["next_states"], dtype=torch.float32)
+        self.pad_lens = torch.tensor(episodes["pad_lens"], dtype=torch.long)
 
         # compute state normalization stats
         self.state_mean = self.next_states.mean(dim=0)   # (state_dim...)
@@ -268,16 +315,14 @@ def plot_data_trajectories(data_name: str, limit: int, plot_name: str) -> None:
     plot_trajectories(trajectories, plot_name)
 
 
-def save_video(state_keys, viz, trajectories, plot_name: str) -> None:
+def save_video(render_fn, trajectories, plot_name: str) -> None:
     if isinstance(trajectories, torch.Tensor):
         trajectories = trajectories.detach().cpu().numpy()
     
     frames = []
     for trajectory in trajectories:
         for state in trajectory:
-            state_dict = to_state_dict(state, state_keys)
-            image = viz.render(state_dict)
-            frames.append(image)
+            frames.append(render_fn(state))
 
     frames[0].save(
         fp=os.path.join(PLOTS_PATH, plot_name), 

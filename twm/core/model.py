@@ -3,14 +3,14 @@ import os
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from typing import Any, Dict
+from typing import Any, Dict, Tuple, Union
 
 
 PARENT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 MODEL_PATH = os.path.join(PARENT_PATH, "models")
 
 
-class AbsolutePositionalEncoding(nn.Module):
+class SinePositionalEncoding(nn.Module):
     '''Implements absolute positional encoding as described in "Attention is All You Need".'''
 
     def __init__(self, d_model: int, max_len: int=256, dropout: float=0.1) -> None:
@@ -48,14 +48,72 @@ class EMA:
         return {k: v.to(self.device) for k, v in self.weights.items()}
 
 
+class ImageEncoder(nn.Module):
+    '''A small CNN to encode images into a (d_model,) embedding for the transformer.'''
+
+    def __init__(self, n_channels: int, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_channels, 32, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, d_model),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, c, h, w = x.shape
+        x = x.view(batch * seq_len, c, h, w)
+        y = self.cnn(x)
+        y = y.view(batch, seq_len, self.d_model)
+        return y
+
+
+class ImageDecoder(nn.Module):
+    '''A small CNN to decode (d_model,) embeddings back into images for the 
+    transformer output.'''
+
+    def __init__(self, image_dims: Tuple[int, int, int], d_model: int) -> None:
+        super().__init__()
+
+        c, h, w = image_dims
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, 128 * 8 * 8),
+            nn.GELU(),
+            nn.Unflatten(1, (128, 8, 8)),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Upsample(size=(h, w), mode='bilinear', align_corners=False),
+            nn.Conv2d(32, c, kernel_size=3, stride=1, padding=1),
+            nn.Sigmoid(),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.output_proj(x)
+        y = y.clamp(1e-8, 1.0 - 1e-8)
+        return y
+
+
 class WorldModel(nn.Module):
     '''A transformer-based world model that predicts the next state given a sequence of 
     past states and actions.'''
 
-    def __init__(self, state_dim: int, action_dim: int, seq_len: int,
-                 d_model: int=64, nhead: int=4, num_layers: int=4, 
+    def __init__(self, state_dim: Union[int, Tuple[int, ...]], action_dim: int, 
+                 seq_len: int, d_model: int=64, nhead: int=4, num_layers: int=4, 
                  dim_feedforward: int=256, dropout: float=0.1, 
-                 use_linear_proj: bool=True, norm_first: bool=True) -> None:
+                 norm_first: bool=True) -> None:
         super().__init__()
 
         self.state_dim = state_dim
@@ -66,16 +124,17 @@ class WorldModel(nn.Module):
         self.num_layers = num_layers
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
-        self.use_linear_proj = use_linear_proj
         self.norm_first = norm_first
 
-        # state -> (d_model,) embedding
-        if use_linear_proj:
-            self.input_proj = nn.Linear(state_dim + action_dim, d_model)
+        # state and action -> (d_model,) embedding
+        # image -> (d_model,) embedding with a small CNN
+        self.visual = isinstance(state_dim, tuple)
+        if self.visual:
+            self.state_proj = ImageEncoder(state_dim[0], d_model)
+            self.action_proj = nn.Linear(action_dim, d_model)
         else:
-            self.d_model = d_model = state_dim + action_dim
-            self.input_proj = nn.Identity()
-
+            self.input_proj = nn.Linear(state_dim + action_dim, d_model)
+        
         # Keep input feature scaling stable regardless of transformer norm mode
         self.input_norm = nn.LayerNorm(d_model)
 
@@ -84,7 +143,7 @@ class WorldModel(nn.Module):
         self.sos_token = nn.Parameter(torch.zeros(d_model))
 
         # absolute positional encoding
-        self.pe = AbsolutePositionalEncoding(d_model, max_len=seq_len, dropout=dropout)
+        self.pe = SinePositionalEncoding(d_model, max_len=seq_len, dropout=dropout)
 
         # transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -102,21 +161,30 @@ class WorldModel(nn.Module):
         self.output_norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
         
         # (d_model,) embedding -> next state prediction
-        self.output_proj = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, state_dim),
-        )
-
-        # Huber loss for stable regression training
-        self.loss_fn = nn.HuberLoss()
+        if self.visual:
+            self.output_proj = ImageDecoder(state_dim, d_model)
+        else:
+            self.output_proj = nn.Sequential(
+                nn.Linear(d_model, d_model * 2),
+                nn.GELU(),
+                nn.Linear(d_model * 2, state_dim),
+            )
+        
+        # Use regression losses for next-state prediction.
+        if self.visual:
+            self.loss_fn = nn.BCELoss()
+        else:
+            self.loss_fn = nn.HuberLoss()
 
         # placeholder normalizer buffers
         self.register_buffer("state_mean", torch.zeros(state_dim))
         self.register_buffer("state_std", torch.ones(state_dim))
         self.register_buffer("action_mean", torch.zeros(action_dim))
         self.register_buffer("action_std", torch.ones(action_dim))
-        self.register_buffer("obs_idx", torch.arange(state_dim, dtype=torch.long))
+        if self.visual:
+            self.register_buffer("obs_idx", None)
+        else:
+            self.register_buffer("obs_idx", torch.arange(state_dim, dtype=torch.long))
 
     @property
     def device(self) -> torch.device:
@@ -127,22 +195,31 @@ class WorldModel(nn.Module):
         self.register_buffer("state_std", dataset.state_std.to(self.device))
         self.register_buffer("action_mean", dataset.action_mean.to(self.device))
         self.register_buffer("action_std", dataset.action_std.to(self.device))
-        if dataset.obs_idx is not None:
-            obs_idx = torch.tensor(dataset.obs_idx, dtype=torch.long, device=self.device)
-        else:
+        if dataset.obs_idx is None:
             obs_idx = None
+        else:
+            obs_idx = torch.tensor(dataset.obs_idx, dtype=torch.long, device=self.device)
         self.register_buffer("obs_idx", obs_idx)
 
     # <----------------------------------- prediction ----------------------------------->
 
-    def forward(self, x: torch.Tensor, pad_lens: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)  # (batch, seq_len, d_model)
-        x = self.input_norm(x)
-
-        # replace padded positions with learnable PAD embedding
-        batch, seq_len = x.shape[:2]
-        pad_mask = self.make_padding_mask(pad_lens, seq_len)  # (batch, seq_len)
+    def forward(self, states: torch.Tensor, actions: torch.Tensor, 
+                pad_lens: torch.Tensor) -> torch.Tensor:
+        
+        # input processing
+        states = self.normalize_states(states)
+        actions = self.normalize_actions(actions)
+        batch, seq_len = actions.shape[:2]
+        if self.visual:
+            x = self.state_proj(states) + self.action_proj(actions)
+        else:
+            x = torch.cat([states, actions], dim=-1)
+            x = self.input_proj(x)  
+        x = self.input_norm(x)   # (batch, seq_len, d_model)
         x = x.clone()
+        
+        # replace padded positions with learnable PAD embedding
+        pad_mask = self.make_padding_mask(pad_lens, seq_len)  # (batch, seq_len)
         x[pad_mask] = self.pad_token
         
         # mark first timestep with a learnable SOS embedding
@@ -157,7 +234,7 @@ class WorldModel(nn.Module):
         x = self.output_norm(x)
         last_real_idx = (seq_len - pad_lens - 1).clamp(min=0)
         batch_idx = torch.arange(batch, device=self.device)
-        x = x[batch_idx, last_real_idx]    
+        x = x[batch_idx, last_real_idx]
         return self.output_proj(x)
 
     def make_padding_mask(self, pad_lens: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -183,10 +260,20 @@ class WorldModel(nn.Module):
         mask = mask.reshape(batch * self.nhead, seq_len, seq_len)
         return mask
 
-    def make_inputs(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        states = (states - self.state_mean) / self.state_std
-        actions = (actions - self.action_mean) / self.action_std
-        return torch.cat([states, actions], dim=-1)
+    def normalize_states(self, states: torch.Tensor) -> torch.Tensor:
+        if self.visual:
+            return states
+        else:
+            return (states - self.state_mean) / self.state_std
+    
+    def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        return (actions - self.action_mean) / self.action_std
+    
+    def unnormalize_states(self, states: torch.Tensor) -> torch.Tensor:
+        if self.visual:
+            return states
+        else:
+            return states * self.state_std + self.state_mean
     
     # <---------------------------- training and evaluation ----------------------------->
 
@@ -197,9 +284,8 @@ class WorldModel(nn.Module):
         next_states = next_states.to(self.device)
         pad_lens = pad_lens.to(self.device)
         
-        targets = (next_states - self.state_mean) / self.state_std
-        x = self.make_inputs(states, actions)
-        pred = self.forward(x, pad_lens)
+        targets = self.normalize_states(next_states)
+        pred = self.forward(states, actions, pad_lens)
         return self.loss_fn(pred, targets)
     
     @torch.no_grad()
@@ -267,7 +353,6 @@ class WorldModel(nn.Module):
             "num_layers": self.num_layers,
             "dim_feedforward": self.dim_feedforward,
             "dropout": self.dropout,
-            "use_linear_proj": self.use_linear_proj,
             "norm_first": self.norm_first,
         }
 
@@ -327,10 +412,9 @@ class RolloutContext:
         self.actions[batch_idx, last_real_idx] = actions
 
         # predict next state using the model
-        x = self.model.make_inputs(self.states, self.actions)
-        pred = self.model.forward(x, self.pad_lens)
-        next_state = pred * self.model.state_std + self.model.state_mean
-
+        pred = self.model.forward(self.states, self.actions, self.pad_lens)
+        next_state = self.model.unnormalize_states(pred)
+        
         # for indices with padding, write next index directly into the buffer
         has_pad = self.pad_lens > 0
         if torch.any(has_pad):
@@ -356,6 +440,7 @@ class RolloutContext:
         init_states = init_states.to(device)
         init_actions = init_actions.to(device)
         if self.model.obs_idx is not None:
+            assert len(init_states.shape) == 3
             init_states = init_states[:, :, self.model.obs_idx]
         self.reset(init_states, init_actions)
                    
@@ -369,5 +454,5 @@ class RolloutContext:
             states = self.step(actions)
             trajectories.append(states)
 
-        return torch.stack(trajectories).permute(1, 0, 2)
+        return torch.stack(trajectories).transpose(0, 1)
     
