@@ -103,7 +103,7 @@ if __name__ == "__main__":
         state_dim = train_loader.dataset.state_dim
         action_dim = train_loader.dataset.action_dim
    
-        model = WorldModel(state_dim, action_dim, seq_len).to('cuda')
+        model = WorldModel(state_dim, action_dim, seq_len, visual=True).to('cuda')
         model.fit(train_loader, epochs=200, lr=0.001, test_data_loader=test_loader, 
                   model_name='pong_image_world_model.pth')
     

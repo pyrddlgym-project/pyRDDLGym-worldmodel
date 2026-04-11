@@ -1,41 +1,22 @@
-import math
 import os
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 from typing import Any, Dict, Tuple, Union
 
+from twm.core.encoding import SinePositionalEncoding, RotaryTransformerEncoderLayer
+from twm.core.projection import VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder
+
+Tensor = torch.Tensor
 
 PARENT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 MODEL_PATH = os.path.join(PARENT_PATH, "models")
 
 
-# <------------------------------- Helper Classes  ------------------------------>
-
-class SinePositionalEncoding(nn.Module):
-    '''Implements absolute positional encoding as described in "Attention is All You Need".'''
-
-    def __init__(self, d_model: int, max_len: int=256, dropout: float=0.1) -> None:
-        super().__init__()
-
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)   # (max_len, 1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))  # (d_model / 2,)
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:x.size(1)]   # (batch, seq_len, d_model)
-        return self.dropout(x)
-
-
 class EMA:
     '''Maintains an exponential moving average of model weights for evaluation stability.'''
 
-    def __init__(self, model: nn.Module, decay: float=0.995) -> None:
+    def __init__(self, model: nn.Module, decay: float=0.999) -> None:
         self.decay = decay
         self.weights = {k: v.clone().float().cpu() for k, v in model.state_dict().items()}
         self.device = next(model.parameters()).device
@@ -46,124 +27,25 @@ class EMA:
             self.weights[k].mul_(self.decay).add_(v.float().cpu(), alpha=1. - self.decay)
 
     @property
-    def state_dict(self) -> Dict[str, torch.Tensor]:
+    def state_dict(self) -> Dict[str, Tensor]:
         return {k: v.to(self.device) for k, v in self.weights.items()}
 
-
-# <------------------------------- Vector In and Out  ------------------------------>
-
-class VectorEncoder(nn.Module):
-    '''A simple MLP to encode vector states and actions into a (d_model,) embedding 
-    for the transformer.'''
-
-    def __init__(self, state_dim: int, action_dim: int, d_model: int) -> None:
-        super().__init__()
-        self.input_proj = nn.Linear(state_dim + action_dim, d_model)
-
-    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([states, actions], dim=-1)
-        batch, seq_len = x.shape[:2]
-        x = x.view(batch * seq_len, -1)
-        y = self.input_proj(x).view(batch, seq_len, -1)
-        return y 
-
-
-class VectorDecoder(nn.Module):
-    '''A simple MLP to decode (d_model,) embeddings back into vector states for the transformer.'''
-
-    def __init__(self, state_dim: int, d_model: int) -> None:
-        super().__init__()
-
-        self.output_proj = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, state_dim),
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.output_proj(x)
-
-
-# <------------------------------- Image In and Out  ------------------------------>
-
-class ImageEncoder(nn.Module):
-    '''A small CNN to encode images into a (d_model,) embedding for the transformer.'''
-
-    def __init__(self, n_channels: int, action_dim: int, d_model: int) -> None:
-        super().__init__()
-
-        self.state_proj = nn.Sequential(
-            nn.Conv2d(n_channels, 32, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
-            nn.Linear(64 * 4 * 4, d_model),
-        )
-        self.action_proj = nn.Linear(action_dim, d_model)
-    
-    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-
-        # project state through cnn
-        batch, seq_len, c, h, w = states.shape
-        states = states.view(batch * seq_len, c, h, w)
-        state_proj = self.state_proj(states).view(batch, seq_len, -1)
-
-        # project action through MLP
-        actions = actions.view(batch * seq_len, -1)
-        action_proj = self.action_proj(actions).view(batch, seq_len, -1)
-
-        # combine state and action projections in embedding space
-        return state_proj + action_proj
-
-
-class ImageDecoder(nn.Module):
-    '''A small CNN to decode (d_model,) embeddings back into images for the 
-    transformer output.'''
-
-    def __init__(self, image_dims: Tuple[int, int, int], d_model: int) -> None:
-        super().__init__()
-
-        c, h, w = image_dims
-        self.output_proj = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, 128 * 8 * 8),
-            nn.GELU(),
-            nn.Unflatten(1, (128, 8, 8)),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Upsample(size=(h, w), mode='bilinear', align_corners=False),
-            nn.Conv2d(32, c, kernel_size=3, stride=1, padding=1),
-            nn.Sigmoid(),
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.output_proj(x).clamp(1e-8, 1.0 - 1e-8)
-
-
-# <------------------------------- World Model  ------------------------------>
 
 class WorldModel(nn.Module):
     '''A transformer-based world model that predicts the next state given a sequence of 
     past states and actions.'''
 
     def __init__(self, state_dim: Union[int, Tuple[int, ...]], action_dim: int, 
-                 seq_len: int, d_model: int=64, nhead: int=4, num_layers: int=4, 
-                 dim_feedforward: int=256, dropout: float=0.1, 
-                 norm_first: bool=True) -> None:
+                 seq_len: int, visual: bool, d_model: int=64, 
+                 nhead: int=4, num_layers: int=4, dim_feedforward: int=256, 
+                 dropout: float=0.1, norm_first: bool=True, 
+                 use_absolute_pe: bool=True, use_rope: bool=True) -> None:
         super().__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.seq_len = seq_len
+        self.visual = visual
         self.d_model = d_model
         self.nhead = nhead
         self.num_layers = num_layers
@@ -171,12 +53,17 @@ class WorldModel(nn.Module):
         self.dropout = dropout
         self.norm_first = norm_first
 
+        self.use_absolute_pe = use_absolute_pe
+        self.use_rope = use_rope
+
         # state and action -> (d_model,) embedding
-        self.visual = isinstance(state_dim, tuple)
         if self.visual:
+            assert isinstance(state_dim, tuple), "For visual inputs, state_dim should be a tuple."
             assert len(state_dim) == 3, "For visual inputs, state_dim should be (C, H, W)."
-            self.input_proj = ImageEncoder(state_dim[0], action_dim, d_model)
+            n_channels = state_dim[0]
+            self.input_proj = ImageEncoder(n_channels, action_dim, d_model)
         else:
+            assert isinstance(state_dim, int), "For vector inputs, state_dim should be an int."
             self.input_proj = VectorEncoder(state_dim, action_dim, d_model)
         
         # Keep input feature scaling stable regardless of transformer norm mode
@@ -186,18 +73,33 @@ class WorldModel(nn.Module):
         self.pad_token = nn.Parameter(torch.zeros(d_model))
         self.sos_token = nn.Parameter(torch.zeros(d_model))
 
-        # absolute positional encoding
-        self.pe = SinePositionalEncoding(d_model, max_len=seq_len, dropout=dropout)
+        # positional encoding
+        if use_absolute_pe:
+            self.pe = SinePositionalEncoding(d_model, max_len=seq_len)
+        else:
+            self.pe = nn.Identity()
+        self.embed_dropout = nn.Dropout(dropout)
 
         # transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=norm_first,
-        )
+        if self.use_rope:
+            encoder_layer = RotaryTransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=norm_first,
+                max_len=seq_len,
+            )
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=norm_first,
+            )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
 
@@ -239,8 +141,7 @@ class WorldModel(nn.Module):
 
     # <----------------------------------- prediction ----------------------------------->
 
-    def forward(self, states: torch.Tensor, actions: torch.Tensor, 
-                pad_lens: torch.Tensor) -> torch.Tensor:
+    def forward(self, states: Tensor, actions: Tensor, pad_lens: Tensor) -> Tensor:
         
         # input processing
         states = self.normalize_states(states)
@@ -259,6 +160,7 @@ class WorldModel(nn.Module):
 
         # positional encoding and transformer
         x = self.pe(x)
+        x = self.embed_dropout(x)
         mask = self.make_full_mask(pad_lens, seq_len, batch)
         x = self.transformer(x, mask=mask)
 
@@ -269,11 +171,11 @@ class WorldModel(nn.Module):
         x = x[batch_idx, last_real_idx]
         return self.output_proj(x)
 
-    def make_padding_mask(self, pad_lens: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def make_padding_mask(self, pad_lens: Tensor, seq_len: int) -> Tensor:
         pos = torch.arange(seq_len, device=self.device)  # (seq_len,)
         return pos.unsqueeze(0) >= (seq_len - pad_lens).unsqueeze(1)  # (batch, seq_len)
     
-    def make_full_mask(self, pad_lens: torch.Tensor, seq_len: int, batch: int) -> torch.Tensor:
+    def make_full_mask(self, pad_lens: Tensor, seq_len: int, batch: int) -> Tensor:
         device = self.device
 
         # create causal mask
@@ -292,16 +194,16 @@ class WorldModel(nn.Module):
         mask = mask.reshape(batch * self.nhead, seq_len, seq_len)
         return mask
 
-    def normalize_states(self, states: torch.Tensor) -> torch.Tensor:
+    def normalize_states(self, states: Tensor) -> Tensor:
         if self.visual:
             return states
         else:
             return (states - self.state_mean) / self.state_std
     
-    def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+    def normalize_actions(self, actions: Tensor) -> Tensor:
         return (actions - self.action_mean) / self.action_std
     
-    def unnormalize_states(self, states: torch.Tensor) -> torch.Tensor:
+    def unnormalize_states(self, states: Tensor) -> Tensor:
         if self.visual:
             return states
         else:
@@ -309,8 +211,8 @@ class WorldModel(nn.Module):
     
     # <---------------------------- training and evaluation ----------------------------->
 
-    def loss(self, states: torch.Tensor, actions: torch.Tensor, next_states: torch.Tensor, 
-             pad_lens: torch.Tensor) -> torch.Tensor:
+    def loss(self, states: Tensor, actions: Tensor, next_states: Tensor, 
+             pad_lens: Tensor) -> Tensor:
         states = states.to(self.device)
         actions = actions.to(self.device)
         next_states = next_states.to(self.device)
@@ -380,12 +282,15 @@ class WorldModel(nn.Module):
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
             "seq_len": self.seq_len,
+            "visual": self.visual,
             "d_model": self.d_model,
             "nhead": self.nhead,
             "num_layers": self.num_layers,
             "dim_feedforward": self.dim_feedforward,
             "dropout": self.dropout,
             "norm_first": self.norm_first,
+            "use_absolute_pe": self.use_absolute_pe,
+            "use_rope": self.use_rope,
         }
 
     def save(self, model_name: str) -> None:
@@ -417,7 +322,7 @@ class RolloutContext:
         self.device = model.device
         self.seq_len = model.seq_len
 
-    def make_padded(self, x: torch.Tensor, req_len: int) -> torch.Tensor:
+    def make_padded(self, x: Tensor, req_len: int) -> Tensor:
         x = x.to(self.device).clone()
         batch, seq_len, *state_shape = x.shape
         if seq_len >= req_len:
@@ -427,7 +332,7 @@ class RolloutContext:
         return torch.cat([x, padding], dim=1)
     
     @torch.no_grad()
-    def reset(self, init_states: torch.Tensor, init_actions: torch.Tensor) -> None:
+    def reset(self, init_states: Tensor, init_actions: Tensor) -> None:
         batch, init_len = init_states.shape[:2]
         self.states = self.make_padded(init_states, self.seq_len)
         self.actions = self.make_padded(init_actions, self.seq_len)
@@ -435,7 +340,7 @@ class RolloutContext:
         self.pad_lens = torch.full((batch,), init_pad, dtype=torch.long, device=self.device)
 
     @torch.no_grad()
-    def step(self, actions: torch.Tensor) -> torch.Tensor:
+    def step(self, actions: Tensor) -> Tensor:
         self.model.eval()
 
         # set actions at the last real token position for each batch item
@@ -464,8 +369,8 @@ class RolloutContext:
         return next_state
     
     @torch.no_grad()
-    def rollout(self, init_states: torch.Tensor, init_actions: torch.Tensor, 
-                vec_policy, max_steps: int) -> torch.Tensor:
+    def rollout(self, init_states: Tensor, init_actions: Tensor, 
+                vec_policy, max_steps: int) -> Tensor:
         device = self.device
         
         # reset rollout context with initial state from environment

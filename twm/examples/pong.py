@@ -3,7 +3,7 @@ import torch
 import pyRDDLGym
 from pyRDDLGym.core.policy import BaseAgent
 
-from twm.core.data import create_data, get_dataloader, to_tensor, \
+from twm.core.data import create_vector_data, get_dataloader, dict_to_tensor, \
     plot_data_trajectories, plot_trajectories, save_video
 from twm.core.model import RolloutContext, WorldModel
 
@@ -58,11 +58,11 @@ def vec_policy(states):
 def create_pong_data(episodes=200, max_steps=200, save_path='pong_data.pkl'):
     env = PongEnvWithRandomStarts()
     policy = PongPolicy()
-    create_data(env, policy, episodes, max_steps, save_path)
+    create_vector_data(env, policy, episodes, max_steps, save_path)
 
 
 def init_torch(*xs, batch_size):
-    new_xs = [torch.tensor(to_tensor(x))[None, None, :] for x in xs]
+    new_xs = [torch.tensor(dict_to_tensor(x))[None, None, :] for x in xs]
     return torch.cat(new_xs, dim=1).expand(batch_size, -1, -1)
 
 
@@ -79,10 +79,13 @@ def plot_model_rollouts(model, batch_size=4):
     trajectories = rollout_context.rollout(
         init_states, init_actions, vec_policy, max_steps=200)
     
-    state_keys = ['ball-x___b1', 'ball-y___b1', 'paddle-y']
+    def render_fn(state_vec):
+        state_keys = ['ball-x___b1', 'ball-y___b1', 'paddle-y']
+        return env._visualizer.render(dict(zip(state_keys, state_vec)))
+    
     plot_data_trajectories('pong_data.pkl', batch_size, 'pong_data_rollouts.png')
     plot_trajectories(trajectories, 'pong_model_rollouts.png')
-    save_video(state_keys, env._visualizer, trajectories, 'pong_model_rollout.gif')
+    save_video(render_fn, trajectories, 'pong_model_rollout.gif')
 
 
 if __name__ == "__main__":
@@ -96,8 +99,9 @@ if __name__ == "__main__":
         state_dim = train_loader.dataset.state_dim
         action_dim = train_loader.dataset.action_dim
    
-        model = WorldModel(state_dim, action_dim, seq_len).to('cuda')
-        model.fit(train_loader, epochs=600, test_data_loader=test_loader, model_name='pong_world_model.pth')
+        model = WorldModel(state_dim, action_dim, seq_len, visual=False).to('cuda')
+        model.fit(train_loader, epochs=700, test_data_loader=test_loader, 
+                  model_name='pong_world_model.pth')
     
     else:
         model = WorldModel.load('pong_world_model.pth').to('cuda')
