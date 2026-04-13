@@ -5,7 +5,9 @@ from tqdm import tqdm
 from typing import Any, Dict, Tuple, Union
 
 from twm.core.encoding import SinePositionalEncoding, RotaryTransformerEncoderLayer
-from twm.core.projection import VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder
+from twm.core.projection import (
+    VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder, DiffusionDecoder
+)
 
 Tensor = torch.Tensor
 
@@ -16,7 +18,7 @@ MODEL_PATH = os.path.join(PARENT_PATH, "models")
 class EMA:
     '''Maintains an exponential moving average of model weights for evaluation stability.'''
 
-    def __init__(self, model: nn.Module, decay: float=0.999) -> None:
+    def __init__(self, model: nn.Module, decay: float=0.995) -> None:
         self.decay = decay
         self.weights = {k: v.clone().float().cpu() for k, v in model.state_dict().items()}
         self.device = next(model.parameters()).device
@@ -39,7 +41,8 @@ class WorldModel(nn.Module):
                  seq_len: int, visual: bool, d_model: int=64, 
                  nhead: int=4, num_layers: int=4, dim_feedforward: int=256, 
                  dropout: float=0.1, norm_first: bool=True, 
-                 use_absolute_pe: bool=True, use_rope: bool=True) -> None:
+                 use_absolute_pe: bool=True, use_rope: bool=True,
+                 use_diffusion_decoder: bool=False) -> None:
         super().__init__()
 
         self.state_dim = state_dim
@@ -55,6 +58,7 @@ class WorldModel(nn.Module):
 
         self.use_absolute_pe = use_absolute_pe
         self.use_rope = use_rope
+        self.use_diffusion_decoder = use_diffusion_decoder
 
         # state and action -> (d_model,) embedding
         if self.visual:
@@ -107,7 +111,10 @@ class WorldModel(nn.Module):
         self.output_norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
         
         # (d_model,) embedding -> next state prediction
-        if self.visual:
+        if self.use_diffusion_decoder:
+            self.output_proj = DiffusionDecoder(state_dim=state_dim, d_model=d_model)
+            self.loss_fn = self.output_proj.loss
+        elif self.visual:
             self.output_proj = ImageDecoder(state_dim, d_model)
             self.loss_fn = nn.BCELoss()
         else:
@@ -141,20 +148,20 @@ class WorldModel(nn.Module):
 
     # <----------------------------------- prediction ----------------------------------->
 
-    def forward(self, states: Tensor, actions: Tensor, pad_lens: Tensor) -> Tensor:
-        
+    def encode_history(self, states: Tensor, actions: Tensor, pad_lens: Tensor) -> Tensor:
+
         # input processing
         states = self.normalize_states(states)
         actions = self.normalize_actions(actions)
         x = self.input_proj(states, actions)   # (batch, seq_len, d_model)
-        x = self.input_norm(x)   
+        x = self.input_norm(x)
         x = x.clone()
-        
+
         # replace padded positions with learnable PAD embedding
         batch, seq_len = actions.shape[:2]
         pad_mask = self.make_padding_mask(pad_lens, seq_len)  # (batch, seq_len)
         x[pad_mask] = self.pad_token
-        
+
         # mark first timestep with a learnable SOS embedding
         x[:, 0] = x[:, 0] + self.sos_token
 
@@ -163,18 +170,30 @@ class WorldModel(nn.Module):
         x = self.embed_dropout(x)
         mask = self.make_full_mask(pad_lens, seq_len, batch)
         x = self.transformer(x, mask=mask)
-
-        # get last real output before padding
         x = self.output_norm(x)
+        return x
+
+    def select_condition(self, latents: Tensor, pad_lens: Tensor) -> Tensor:
+        if getattr(self.output_proj, 'condition_mode', 'last') == 'sequence':
+            return latents
+
+        batch, seq_len = latents.shape[:2]
         last_real_idx = (seq_len - pad_lens - 1).clamp(min=0)
         batch_idx = torch.arange(batch, device=self.device)
-        x = x[batch_idx, last_real_idx]
-        return self.output_proj(x)
+        return latents[batch_idx, last_real_idx]
 
+    def forward(self, states: Tensor, actions: Tensor, pad_lens: Tensor,
+                return_cond: bool=False) -> Tensor:
+        latents = self.encode_history(states, actions, pad_lens)
+        x = self.select_condition(latents, pad_lens)
+        return x if return_cond else self.output_proj(x)
+
+    @torch.no_grad()
     def make_padding_mask(self, pad_lens: Tensor, seq_len: int) -> Tensor:
         pos = torch.arange(seq_len, device=self.device)  # (seq_len,)
         return pos.unsqueeze(0) >= (seq_len - pad_lens).unsqueeze(1)  # (batch, seq_len)
     
+    @torch.no_grad()
     def make_full_mask(self, pad_lens: Tensor, seq_len: int, batch: int) -> Tensor:
         device = self.device
 
@@ -219,7 +238,7 @@ class WorldModel(nn.Module):
         pad_lens = pad_lens.to(self.device)
         
         targets = self.normalize_states(next_states)
-        pred = self.forward(states, actions, pad_lens)
+        pred = self.forward(states, actions, pad_lens, return_cond=self.use_diffusion_decoder)
         return self.loss_fn(pred, targets)
     
     @torch.no_grad()
@@ -291,6 +310,7 @@ class WorldModel(nn.Module):
             "norm_first": self.norm_first,
             "use_absolute_pe": self.use_absolute_pe,
             "use_rope": self.use_rope,
+            "use_diffusion_decoder": self.use_diffusion_decoder,
         }
 
     def save(self, model_name: str) -> None:
@@ -322,6 +342,7 @@ class RolloutContext:
         self.device = model.device
         self.seq_len = model.seq_len
 
+    @torch.no_grad()
     def make_padded(self, x: Tensor, req_len: int) -> Tensor:
         x = x.to(self.device).clone()
         batch, seq_len, *state_shape = x.shape

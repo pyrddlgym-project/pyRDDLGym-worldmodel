@@ -1,8 +1,7 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union, cast
+from typing import Optional, Tuple, Union
 
 Tensor = torch.Tensor
 
@@ -14,8 +13,8 @@ class SinePositionalEncoding(nn.Module):
         super().__init__()
 
         position = torch.arange(max_len).unsqueeze(1)   # (max_len, 1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(base) / d_model))  # (d_model / 2,)
+        log_base = torch.log(torch.tensor(base))
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-log_base / d_model))  # (d_model / 2,)
         pe = torch.zeros(max_len, d_model)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -47,10 +46,8 @@ class RotaryPositionalEmbedding(nn.Module):
 
     def forward(self, q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
         seq_len = q.size(-2)
-        cos_cache = cast(Tensor, self.cos)
-        sin_cache = cast(Tensor, self.sin)
-        cos = cos_cache[:seq_len].to(device=q.device, dtype=q.dtype)
-        sin = sin_cache[:seq_len].to(device=q.device, dtype=q.dtype)
+        cos = self.cos[:seq_len].to(device=q.device, dtype=q.dtype)
+        sin = self.sin[:seq_len].to(device=q.device, dtype=q.dtype)
         cos = torch.repeat_interleave(cos, 2, dim=-1).unsqueeze(0).unsqueeze(0)
         sin = torch.repeat_interleave(sin, 2, dim=-1).unsqueeze(0).unsqueeze(0)
         q = q * cos + self._rotate_half(q) * sin

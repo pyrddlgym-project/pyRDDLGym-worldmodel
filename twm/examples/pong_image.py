@@ -95,7 +95,7 @@ def plot_model_rollouts(model, batch_size=4):
 if __name__ == "__main__":
     #create_pong_data()
     seq_len = 10
-    fit = False
+    fit = True
 
     if fit:
         train_loader, test_loader = get_dataloader(
@@ -103,8 +103,9 @@ if __name__ == "__main__":
         state_dim = train_loader.dataset.state_dim
         action_dim = train_loader.dataset.action_dim
    
-        model = WorldModel(state_dim, action_dim, seq_len, visual=True).to('cuda')
-        model.fit(train_loader, epochs=200, lr=0.001, test_data_loader=test_loader, 
+        model = WorldModel(state_dim, action_dim, seq_len, visual=True, use_rope=True,
+                           use_diffusion_decoder=True).to('cuda')
+        model.fit(train_loader, epochs=1000, lr=0.0005, test_data_loader=test_loader, 
                   model_name='pong_image_world_model.pth')
     
     else:

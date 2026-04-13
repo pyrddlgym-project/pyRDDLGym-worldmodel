@@ -1,6 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Tuple
+import torch.nn.functional as F
+from typing import Optional, Tuple, Union
 
 Tensor = torch.Tensor
 
@@ -25,6 +27,8 @@ class VectorEncoder(nn.Module):
 
 class VectorDecoder(nn.Module):
     '''A simple MLP to decode (d_model,) embeddings back into vector states for the transformer.'''
+
+    condition_mode = 'last'
 
     def __init__(self, state_dim: int, d_model: int) -> None:
         super().__init__()
@@ -77,6 +81,8 @@ class ImageDecoder(nn.Module):
     '''A small CNN to decode (d_model,) embeddings back into images for the 
     transformer output.'''
 
+    condition_mode = 'last'
+
     def __init__(self, image_dims: Tuple[int, int, int], d_model: int) -> None:
         super().__init__()
 
@@ -102,3 +108,216 @@ class ImageDecoder(nn.Module):
     
     def forward(self, x: Tensor) -> Tensor:
         return self.output_proj(x).clamp(1e-8, 1.0 - 1e-8)
+
+
+# <------------------------------- Diffusion Out  ------------------------------>
+
+class SinusoidalPosEmb(nn.Module):
+    '''Generates sinusoidal positional embeddings for a given input tensor of timesteps.'''
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: Tensor) -> Tensor:
+        half_dim = self.dim // 2
+        emb_scale = np.log(10000) / max(half_dim - 1, 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb_scale)
+        emb = t.float().unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        if emb.size(-1) < self.dim:
+            emb = F.pad(emb, (0, self.dim - emb.size(-1)))
+        return emb
+
+
+class ResidualBlock2D(nn.Module):
+    '''A residual block with two 3x3 convolutions and FiLM conditioning on a (d_model,) embedding.'''
+
+    def __init__(self, in_ch: int, out_ch: int, emb_dim: int, groups: int=8) -> None:
+        super().__init__()
+
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.norm1 = nn.GroupNorm(groups, in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.emb_proj = nn.Linear(emb_dim, out_ch * 2)
+        self.skip = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        scale_shift = self.emb_proj(emb).unsqueeze(-1).unsqueeze(-1)
+        scale, shift = torch.chunk(scale_shift, 2, dim=1)
+        h = self.norm2(h)
+        h = h * (1 + scale) + shift
+        h = self.conv2(F.silu(h))
+        return h + self.skip(x)
+
+
+class ConditionalUNet2D(nn.Module):
+    '''A UNet for 2D image states, conditioned on a (d_model,) embedding.'''
+
+    def __init__(self, in_channels: int, cond_dim: int, base_dim: int=32,
+                 dim_mults: Tuple[int, ...]=(1, 2, 4)) -> None:
+        super().__init__()
+
+        emb_dim = base_dim * 4
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(base_dim),
+            nn.Linear(base_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cond_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+        dims = [base_dim * m for m in dim_mults]
+        self.in_conv = nn.Conv2d(in_channels, dims[0], kernel_size=3, padding=1)
+
+        self.down_blocks = nn.ModuleList()
+        self.downsample = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            self.down_blocks.append(
+                nn.ModuleList([
+                    ResidualBlock2D(dims[i], dims[i], emb_dim),
+                    ResidualBlock2D(dims[i], dims[i], emb_dim),
+                ])
+            )
+            self.downsample.append(
+                nn.Conv2d(dims[i], dims[i + 1], kernel_size=4, stride=2, padding=1))
+
+        mid_dim = dims[-1]
+        self.mid1 = ResidualBlock2D(mid_dim, mid_dim, emb_dim)
+        self.mid2 = ResidualBlock2D(mid_dim, mid_dim, emb_dim)
+
+        self.up_blocks = nn.ModuleList()
+        self.upsample = nn.ModuleList()
+        rev_dims = list(reversed(dims))
+        for i in range(len(rev_dims) - 1):
+            in_ch = rev_dims[i] + rev_dims[i + 1]
+            out_ch = rev_dims[i + 1]
+            self.up_blocks.append(
+                nn.ModuleList([
+                    ResidualBlock2D(in_ch, out_ch, emb_dim),
+                    ResidualBlock2D(out_ch, out_ch, emb_dim),
+                ])
+            )
+            self.upsample.append(nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1))
+
+        self.out_norm = nn.GroupNorm(8, dims[0])
+        self.out_conv = nn.Conv2d(dims[0], in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x: Tensor, t: Tensor, cond: Tensor) -> Tensor:
+        emb = self.time_mlp(t) + self.cond_mlp(cond)
+
+        h = self.in_conv(x)
+        skips = []
+        for blocks, down in zip(self.down_blocks, self.downsample):
+            h = blocks[0](h, emb)
+            h = blocks[1](h, emb)
+            skips.append(h)
+            h = down(h)
+
+        h = self.mid1(h, emb)
+        h = self.mid2(h, emb)
+
+        for blocks, up in zip(self.up_blocks, self.upsample):
+            skip = skips.pop()
+            h = F.interpolate(h, size=skip.shape[-2:], mode='nearest')
+            h = torch.cat([h, skip], dim=1)
+            h = blocks[0](h, emb)
+            h = blocks[1](h, emb)
+            h = up(h)
+
+        h = F.silu(self.out_norm(h))
+        return self.out_conv(h)
+
+
+class DiffusionDecoder(nn.Module):
+    '''UNet-based conditional diffusion decoder for image states.'''
+
+    condition_mode = 'last'
+
+    def __init__(self, state_dim: Union[int, Tuple[int, ...]], d_model: int,
+                 n_diffusion_steps: int=128, hidden_dim: int=32,
+                 clamp_output: bool=True) -> None:
+        super().__init__()
+
+        if not isinstance(state_dim, tuple):
+            raise ValueError('DiffusionDecoder expects state_dim as tuple.')
+        if len(state_dim) != 3:
+            raise ValueError('DiffusionDecoder requires state_dim to be (C, H, W).')
+
+        self.state_shape = tuple(state_dim)
+        self.n_diffusion_steps = n_diffusion_steps
+        self.clamp_output = clamp_output
+
+        self.denoiser = ConditionalUNet2D(
+            in_channels=self.state_shape[0], cond_dim=d_model, base_dim=hidden_dim)
+
+        betas = self.cosine_beta_schedule(n_diffusion_steps)
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alpha_bars', alpha_bars)
+        self.register_buffer('sqrt_alpha_bars', torch.sqrt(alpha_bars))
+        self.register_buffer('sqrt_one_minus_alpha_bars', torch.sqrt(1.0 - alpha_bars))
+        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / alphas))
+
+    @staticmethod
+    def cosine_beta_schedule(timesteps: int, s: float=0.008) -> Tensor:
+        steps = timesteps + 1
+        x = np.linspace(0, steps, steps)
+        alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas_clipped = np.clip(betas, a_min=0, a_max=0.999)
+        return torch.tensor(betas_clipped, dtype=torch.float32)
+
+    def extract(self, coeff: Tensor, t: Tensor, ndim: int) -> Tensor:
+        return coeff.gather(0, t).view(t.size(0), *([1] * (ndim - 1)))
+
+    def q_sample(self, x0: Tensor, t: Tensor, noise: Optional[Tensor]=None) -> Tensor:
+        if noise is None:
+            noise = torch.randn_like(x0)
+        sqrt_ab = self.extract(self.sqrt_alpha_bars, t, x0.ndim)
+        sqrt_omb = self.extract(self.sqrt_one_minus_alpha_bars, t, x0.ndim)
+        return sqrt_ab * x0 + sqrt_omb * noise
+
+    def loss(self, cond: Tensor, target: Tensor) -> Tensor:
+        batch = target.size(0)
+        device = target.device
+        t = torch.randint(0, self.n_diffusion_steps, (batch,), device=device)
+
+        noise = torch.randn_like(target)
+        x_t = self.q_sample(target, t, noise)
+        eps_pred = self.denoiser(x_t, t, cond)
+        return F.mse_loss(eps_pred, noise)
+
+    @torch.no_grad()
+    def forward(self, cond: Tensor) -> Tensor:
+        batch = cond.size(0)
+        x_t = torch.randn(batch, *self.state_shape, device=cond.device)
+        
+        for i in reversed(range(self.n_diffusion_steps)):
+            t = torch.full((batch,), i, device=cond.device, dtype=torch.long)
+            eps_pred = self.denoiser(x_t, t, cond)
+
+            beta_t = self.extract(self.betas, t, x_t.ndim)
+            sqrt_omb_t = self.extract(self.sqrt_one_minus_alpha_bars, t, x_t.ndim)
+            sqrt_inv_a_t = self.extract(self.sqrt_recip_alphas, t, x_t.ndim)
+
+            x_t = sqrt_inv_a_t * (x_t - (beta_t / sqrt_omb_t) * eps_pred)
+            if i > 0:
+                noise = torch.randn_like(x_t)
+                x_t = x_t + torch.sqrt(beta_t) * noise
+
+        if self.clamp_output:
+            x_t = x_t.clamp(0.0, 1.0)
+        return x_t
