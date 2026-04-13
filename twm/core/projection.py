@@ -162,6 +162,7 @@ class ConditionalUNet2D(nn.Module):
                  dim_mults: Tuple[int, ...]=(1, 2, 4)) -> None:
         super().__init__()
 
+        # compute the embedding dimension for the conditioning MLPs
         emb_dim = base_dim * 4
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(base_dim),
@@ -175,9 +176,11 @@ class ConditionalUNet2D(nn.Module):
             nn.Linear(emb_dim, emb_dim),
         )
 
+        # compute the channel dimensions for each level of the UNet
         dims = [base_dim * m for m in dim_mults]
         self.in_conv = nn.Conv2d(in_channels, dims[0], kernel_size=3, padding=1)
 
+        # create the downsampling and upsampling blocks of the UNet
         self.down_blocks = nn.ModuleList()
         self.downsample = nn.ModuleList()
         for i in range(len(dims) - 1):
@@ -190,10 +193,12 @@ class ConditionalUNet2D(nn.Module):
             self.downsample.append(
                 nn.Conv2d(dims[i], dims[i + 1], kernel_size=4, stride=2, padding=1))
 
+        # bottleneck residual blocks
         mid_dim = dims[-1]
         self.mid1 = ResidualBlock2D(mid_dim, mid_dim, emb_dim)
         self.mid2 = ResidualBlock2D(mid_dim, mid_dim, emb_dim)
 
+        # create the upsampling blocks of the UNet
         self.up_blocks = nn.ModuleList()
         self.upsample = nn.ModuleList()
         rev_dims = list(reversed(dims))
@@ -208,12 +213,15 @@ class ConditionalUNet2D(nn.Module):
             )
             self.upsample.append(nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1))
 
+        # final normalization and output convolution
         self.out_norm = nn.GroupNorm(8, dims[0])
         self.out_conv = nn.Conv2d(dims[0], in_channels, kernel_size=3, padding=1)
 
     def forward(self, x: Tensor, t: Tensor, cond: Tensor) -> Tensor:
+        # compute the conditioning embedding
         emb = self.time_mlp(t) + self.cond_mlp(cond)
 
+        # forward pass through the UNet
         h = self.in_conv(x)
         skips = []
         for blocks, down in zip(self.down_blocks, self.downsample):
@@ -222,9 +230,11 @@ class ConditionalUNet2D(nn.Module):
             skips.append(h)
             h = down(h)
 
+        # bottleneck
         h = self.mid1(h, emb)
         h = self.mid2(h, emb)
 
+        # forward pass through upsampling path with skip connections
         for blocks, up in zip(self.up_blocks, self.upsample):
             skip = skips.pop()
             h = F.interpolate(h, size=skip.shape[-2:], mode='nearest')
@@ -233,6 +243,7 @@ class ConditionalUNet2D(nn.Module):
             h = blocks[1](h, emb)
             h = up(h)
 
+        # final normalization and output convolution
         h = F.silu(self.out_norm(h))
         return self.out_conv(h)
 
@@ -272,6 +283,7 @@ class DiffusionDecoder(nn.Module):
 
     @staticmethod
     def cosine_beta_schedule(timesteps: int, s: float=0.008) -> Tensor:
+        '''Generates a cosine schedule of betas for the diffusion process.'''
         steps = timesteps + 1
         x = np.linspace(0, steps, steps)
         alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
@@ -281,9 +293,11 @@ class DiffusionDecoder(nn.Module):
         return torch.tensor(betas_clipped, dtype=torch.float32)
 
     def extract(self, coeff: Tensor, t: Tensor, ndim: int) -> Tensor:
+        '''Extracts the appropriate coefficients for a batch of timesteps and reshapes for broadcasting.'''
         return coeff.gather(0, t).view(t.size(0), *([1] * (ndim - 1)))
 
     def q_sample(self, x0: Tensor, t: Tensor, noise: Optional[Tensor]=None) -> Tensor:
+        '''Adds noise to the input image x0 according to the diffusion process at timestep t.'''
         if noise is None:
             noise = torch.randn_like(x0)
         sqrt_ab = self.extract(self.sqrt_alpha_bars, t, x0.ndim)
@@ -291,9 +305,10 @@ class DiffusionDecoder(nn.Module):
         return sqrt_ab * x0 + sqrt_omb * noise
 
     def loss(self, cond: Tensor, target: Tensor) -> Tensor:
+        '''Computes the MSE loss between the predicted noise and the true noise for a batch of 
+        target images and conditions.'''
         batch = target.size(0)
-        device = target.device
-        t = torch.randint(0, self.n_diffusion_steps, (batch,), device=device)
+        t = torch.randint(0, self.n_diffusion_steps, (batch,), device=target.device)
 
         noise = torch.randn_like(target)
         x_t = self.q_sample(target, t, noise)
@@ -302,6 +317,8 @@ class DiffusionDecoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, cond: Tensor) -> Tensor:
+        '''Generates an image by iteratively denoising from pure noise, conditioned on the input 
+        embedding.'''
         batch = cond.size(0)
         x_t = torch.randn(batch, *self.state_shape, device=cond.device)
         

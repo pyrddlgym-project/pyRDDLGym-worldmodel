@@ -25,11 +25,13 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        '''Updates the EMA weights by blending them with the current model weights.'''
         for k, v in model.state_dict().items():
             self.weights[k].mul_(self.decay).add_(v.float().cpu(), alpha=1. - self.decay)
 
     @property
     def state_dict(self) -> Dict[str, Tensor]:
+        '''Returns the EMA weights as a state dictionary, moved to the appropriate device.'''
         return {k: v.to(self.device) for k, v in self.weights.items()}
 
 
@@ -41,7 +43,7 @@ class WorldModel(nn.Module):
                  seq_len: int, visual: bool, d_model: int=64, 
                  nhead: int=4, num_layers: int=4, dim_feedforward: int=256, 
                  dropout: float=0.1, norm_first: bool=True, 
-                 use_absolute_pe: bool=True, use_rope: bool=True,
+                 use_absolute_pe: bool=True, use_rope: bool=True, 
                  use_diffusion_decoder: bool=False) -> None:
         super().__init__()
 
@@ -133,9 +135,11 @@ class WorldModel(nn.Module):
 
     @property
     def device(self) -> torch.device:
+        '''Convenience property to get the device of the model parameters.'''
         return next(self.parameters()).device
 
     def set_dataset_stats(self, dataset) -> None:
+        '''Sets the normalization statistics for states and actions based on the provided dataset.'''
         self.register_buffer("state_mean", dataset.state_mean.to(self.device))
         self.register_buffer("state_std", dataset.state_std.to(self.device))
         self.register_buffer("action_mean", dataset.action_mean.to(self.device))
@@ -149,7 +153,7 @@ class WorldModel(nn.Module):
     # <----------------------------------- prediction ----------------------------------->
 
     def encode_history(self, states: Tensor, actions: Tensor, pad_lens: Tensor) -> Tensor:
-
+        '''Encodes a history of states and actions into a sequence of latents using the transformer.'''
         # input processing
         states = self.normalize_states(states)
         actions = self.normalize_actions(actions)
@@ -174,27 +178,39 @@ class WorldModel(nn.Module):
         return x
 
     def select_condition(self, latents: Tensor, pad_lens: Tensor) -> Tensor:
+        '''Selects the appropriate latent from the transformer output to feed into the decoder.'''
+        # if using sequence-level conditioning, return the full sequence of latents
         if getattr(self.output_proj, 'condition_mode', 'last') == 'sequence':
             return latents
-
+            
+        # otherwise, select the latents corresponding to the last real tokens
         batch, seq_len = latents.shape[:2]
         last_real_idx = (seq_len - pad_lens - 1).clamp(min=0)
         batch_idx = torch.arange(batch, device=self.device)
         return latents[batch_idx, last_real_idx]
 
     def forward(self, states: Tensor, actions: Tensor, pad_lens: Tensor,
-                return_cond: bool=False) -> Tensor:
+                latent: bool=False, unnormalize: bool=False) -> Tensor:
+        '''Predicts the next state or latent given a history of states and actions.'''
         latents = self.encode_history(states, actions, pad_lens)
         x = self.select_condition(latents, pad_lens)
-        return x if return_cond else self.output_proj(x)
-
+        if latent:
+            return x
+        
+        x = self.output_proj(x)
+        if unnormalize:
+            x = self.unnormalize_states(x)
+        return x
+    
     @torch.no_grad()
     def make_padding_mask(self, pad_lens: Tensor, seq_len: int) -> Tensor:
-        pos = torch.arange(seq_len, device=self.device)  # (seq_len,)
+        '''Creates a boolean mask indicating which positions in the input sequence are padding.'''
+        pos = torch.arange(seq_len, device=self.device)
         return pos.unsqueeze(0) >= (seq_len - pad_lens).unsqueeze(1)  # (batch, seq_len)
     
     @torch.no_grad()
     def make_full_mask(self, pad_lens: Tensor, seq_len: int, batch: int) -> Tensor:
+        ''''Creates a combined mask that incorporates both causal masking and padding masking.'''
         device = self.device
 
         # create causal mask
@@ -214,15 +230,18 @@ class WorldModel(nn.Module):
         return mask
 
     def normalize_states(self, states: Tensor) -> Tensor:
+        '''Normalizes states using the dataset statistics, or returns raw states if visual.'''
         if self.visual:
             return states
         else:
             return (states - self.state_mean) / self.state_std
     
     def normalize_actions(self, actions: Tensor) -> Tensor:
+        '''Normalizes actions using the dataset statistics.'''
         return (actions - self.action_mean) / self.action_std
     
     def unnormalize_states(self, states: Tensor) -> Tensor:
+        '''Unnormalizes states using the dataset statistics, or returns raw states if visual.'''
         if self.visual:
             return states
         else:
@@ -232,17 +251,20 @@ class WorldModel(nn.Module):
 
     def loss(self, states: Tensor, actions: Tensor, next_states: Tensor, 
              pad_lens: Tensor) -> Tensor:
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        next_states = next_states.to(self.device)
-        pad_lens = pad_lens.to(self.device)
+        '''Computes the loss between predicted and true next states for a batch of sequences.'''
+        device = self.device
+        states = states.to(device)
+        actions = actions.to(device)
+        next_states = next_states.to(device)
+        pad_lens = pad_lens.to(device)
         
         targets = self.normalize_states(next_states)
-        pred = self.forward(states, actions, pad_lens, return_cond=self.use_diffusion_decoder)
+        pred = self.forward(states, actions, pad_lens, latent=self.use_diffusion_decoder)
         return self.loss_fn(pred, targets)
     
     @torch.no_grad()
     def evaluate(self, data_loader) -> float:
+        '''Evaluates the model on a test dataset and returns the average loss.'''
         self.eval()
         
         if data_loader is None: 
@@ -255,13 +277,15 @@ class WorldModel(nn.Module):
 
     def fit(self, train_data_loader, epochs: int, lr: float=1e-3, lr_decay: float=0.9, 
             test_data_loader=None, model_name: str='') -> None:
-                
+        '''Trains the world model, optionally evaluating on a test dataset after each epoch.'''        
         self.set_dataset_stats(train_data_loader.dataset)
 
+        # create optimizer and learning rate scheduler
         optim = torch.optim.Adam(self.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optim, factor=lr_decay, patience=10, min_lr=1e-5)
         
+        # maintain EMA of weights for more stable evaluation
         ema = EMA(self)
 
         for epoch in range(epochs):
@@ -297,6 +321,7 @@ class WorldModel(nn.Module):
     # <---------------------------- loading and saving ----------------------------->
 
     def _config(self) -> Dict[str, Any]:
+        '''Returns a dictionary of the model configuration parameters for saving.'''
         return {
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
@@ -314,6 +339,7 @@ class WorldModel(nn.Module):
         }
 
     def save(self, model_name: str) -> None:
+        '''Saves the model configuration and weights to a file for later loading.'''
         checkpoint = {
             "config": self._config(),
             "state_dict": self.state_dict(),
@@ -322,6 +348,7 @@ class WorldModel(nn.Module):
 
     @classmethod
     def load(cls, model_name: str, device: str="cuda") -> "WorldModel":
+        '''Loads a model from a file, reconstructing the architecture from the saved configuration.'''
         checkpoint = torch.load(os.path.join(MODEL_PATH, model_name), map_location=device)
         config = checkpoint["config"]
         state_dict = checkpoint["state_dict"]
@@ -344,6 +371,7 @@ class RolloutContext:
 
     @torch.no_grad()
     def make_padded(self, x: Tensor, req_len: int) -> Tensor:
+        '''Pads a sequence of states or actions to the required length for the model input.'''
         x = x.to(self.device).clone()
         batch, seq_len, *state_shape = x.shape
         if seq_len >= req_len:
@@ -354,6 +382,7 @@ class RolloutContext:
     
     @torch.no_grad()
     def reset(self, init_states: Tensor, init_actions: Tensor) -> None:
+        '''Resets the rollout context with initial states and actions.'''
         batch, init_len = init_states.shape[:2]
         self.states = self.make_padded(init_states, self.seq_len)
         self.actions = self.make_padded(init_actions, self.seq_len)
@@ -362,6 +391,8 @@ class RolloutContext:
 
     @torch.no_grad()
     def step(self, actions: Tensor) -> Tensor:
+        '''Performs a rollout step by feeding the current context into the model to predict 
+        the next state, then updating the context with the new state and action.'''
         self.model.eval()
 
         # set actions at the last real token position for each batch item
@@ -370,8 +401,8 @@ class RolloutContext:
         self.actions[batch_idx, last_real_idx] = actions
 
         # predict next state using the model
-        pred = self.model.forward(self.states, self.actions, self.pad_lens)
-        next_state = self.model.unnormalize_states(pred)
+        next_state = self.model.forward(
+            self.states, self.actions, self.pad_lens, latent=False, unnormalize=True)
         
         # for indices with padding, write next index directly into the buffer
         has_pad = self.pad_lens > 0
@@ -392,6 +423,7 @@ class RolloutContext:
     @torch.no_grad()
     def rollout(self, init_states: Tensor, init_actions: Tensor, 
                 vec_policy, max_steps: int) -> Tensor:
+        '''Performs a rollout using the world model and a given policy.'''
         device = self.device
         
         # reset rollout context with initial state from environment
