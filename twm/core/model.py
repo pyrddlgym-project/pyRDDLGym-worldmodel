@@ -277,13 +277,14 @@ class WorldModel(nn.Module):
             loss += self.loss(states, actions, next_states, pad_lens).item()
         return loss / len(data_loader)
 
-    def fit(self, train_data_loader, epochs: int, lr: float=1e-3, lr_decay: float=0.9, 
+    def fit(self, train_data_loader, epochs: int, 
+            optimizer=torch.optim.Adam, lr: float=1e-3, lr_decay: float=0.9, 
             test_data_loader=None, model_name: str='') -> None:
         '''Trains the world model, optionally evaluating on a test dataset after each epoch.'''        
         self.set_dataset_stats(train_data_loader.dataset)
 
         # create optimizer and learning rate scheduler
-        optim = torch.optim.Adam(self.parameters(), lr=lr)
+        optim = optimizer(self.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optim, factor=lr_decay, patience=10, min_lr=1e-5)
         
