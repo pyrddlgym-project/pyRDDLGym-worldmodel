@@ -237,7 +237,7 @@ class SequenceDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def make_padded(x: Array, t: int, seq_len: int) -> Tuple[Array, int]:
-        '''Returns a padded sequence of length seq_len ending at time t, along with the padding length.'''
+        '''Returns a padded sequence of length seq_len ending at time t, along with the pad length.'''
         start = max(0, t - seq_len + 1)
         hist = x[start:t + 1]
         pad_len = seq_len - hist.shape[0]
@@ -246,12 +246,12 @@ class SequenceDataset(torch.utils.data.Dataset):
         return new_x, pad_len
 
     @staticmethod
-    def increase_padding(x: torch.Tensor, old_pad: int, new_pad: int) -> torch.Tensor:
-        '''Increases the padding of a sequence tensor from old_pad to new_pad by shifting the real data.'''
+    def increase_padding(x: Array, old_pad: int, new_pad: int) -> Array:
+        '''Increases the padding of a sequence tensor from old_pad to new_pad.'''
         seq_len = x.shape[0]
         old_real = seq_len - old_pad
         new_real = seq_len - new_pad
-        y = torch.zeros_like(x)
+        y = np.zeros_like(x)
         y[:new_real] = x[old_real - new_real:old_real]
         return y
 
@@ -263,38 +263,31 @@ class SequenceDataset(torch.utils.data.Dataset):
         ep = self._episodes[ep_idx]
         
         # get padded sequences of states, actions, rewards, dones, and next_states
-        states_w, pad = self.make_padded(ep['states'], t, self.seq_len)
-        actions_w, _ = self.make_padded(ep['actions'], t, self.seq_len)
-        rewards_w, _ = self.make_padded(ep['rewards'], t, self.seq_len)
-        dones_w, _ = self.make_padded(ep['dones'], t, self.seq_len)
-
-        states = torch.tensor(states_w, dtype=torch.float32)
-        actions = torch.tensor(actions_w, dtype=torch.float32)
-        rewards = torch.tensor(rewards_w, dtype=torch.float32)
-        dones = torch.tensor(dones_w, dtype=torch.bool)
-        next_states = torch.tensor(ep['next_states'][t], dtype=torch.float32)
-        pad_lens = torch.tensor(pad, dtype=torch.long)
+        states, pad = self.make_padded(ep['states'], t, self.seq_len)
+        actions, _ = self.make_padded(ep['actions'], t, self.seq_len)
+        rewards, _ = self.make_padded(ep['rewards'], t, self.seq_len)
+        dones, _ = self.make_padded(ep['dones'], t, self.seq_len)
+        next_states = ep['next_states'][t]
 
         # HER-style: pick a random virtual start in [current_pad_len, seq_len-1]
         if self.augment_starts:
             seq_len = states.shape[0]
-            old_pad = int(pad_lens.item())
-            max_pad = max(seq_len - self.min_frames, old_pad)
-            new_pad = int(torch.randint(old_pad, max_pad + 1, (1,)).item())
-            if new_pad > old_pad:
-                states = SequenceDataset.increase_padding(states, old_pad, new_pad)
-                actions = SequenceDataset.increase_padding(actions, old_pad, new_pad)
-                rewards = SequenceDataset.increase_padding(rewards, old_pad, new_pad)
-                dones = SequenceDataset.increase_padding(dones, old_pad, new_pad)
-                pad_lens = torch.tensor(new_pad, dtype=torch.long)
+            max_pad = max(seq_len - self.min_frames, pad)
+            new_pad = np.random.randint(pad, max_pad + 1)
+            if new_pad > pad:
+                states = SequenceDataset.increase_padding(states, pad, new_pad)
+                actions = SequenceDataset.increase_padding(actions, pad, new_pad)
+                rewards = SequenceDataset.increase_padding(rewards, pad, new_pad)
+                dones = SequenceDataset.increase_padding(dones, pad, new_pad)
+                pad = new_pad
 
         return (
-            states,          # (context_len, state_dim...)
-            actions,         # (context_len, action_dim,)
-            rewards,         # (context_len,)
-            dones,           # (context_len,)
-            next_states,     # (state_dim...)
-            pad_lens,        # (,)
+            torch.tensor(states, dtype=torch.float32),          # (context_len, state_dim...)
+            torch.tensor(actions, dtype=torch.float32),         # (context_len, action_dim,)
+            torch.tensor(rewards, dtype=torch.float32),         # (context_len,)
+            torch.tensor(dones, dtype=torch.bool),              # (context_len,)
+            torch.tensor(next_states, dtype=torch.float32),     # (state_dim...)
+            torch.tensor(pad, dtype=torch.long),                # (,)
         )
     
 
