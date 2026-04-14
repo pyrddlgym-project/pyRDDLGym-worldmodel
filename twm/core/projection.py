@@ -48,17 +48,26 @@ class VectorDecoder(nn.Module):
 class ImageEncoder(nn.Module):
     '''A small CNN to encode images into a (d_model,) embedding for the transformer.'''
 
-    def __init__(self, n_channels: int, action_dim: int, d_model: int) -> None:
+    def __init__(self, n_channels: int, action_dim: int, d_model: int,
+                 sizes=(32, 64, 128)) -> None:
         super().__init__()
 
+        if len(sizes) == 0:
+            raise ValueError("ImageEncoder sizes must contain at least one channel width.")
+
+        # create conv layers
+        conv_layers = []
+        in_ch = n_channels
+        for out_ch in sizes:
+            conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1))
+            conv_layers.append(nn.GELU())
+            in_ch = out_ch
+
         self.state_proj = nn.Sequential(
-            nn.Conv2d(n_channels, 32, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
+            *conv_layers,
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
-            nn.Linear(64 * 4 * 4, d_model),
+            nn.Linear(sizes[-1] * 4 * 4, d_model),
         )
         self.action_proj = nn.Linear(action_dim, d_model)
     
@@ -83,26 +92,36 @@ class ImageDecoder(nn.Module):
 
     condition_mode = 'last'
 
-    def __init__(self, image_dims: Tuple[int, int, int], d_model: int) -> None:
+    def __init__(self, image_dims: Tuple[int, int, int], d_model: int,
+                 sizes=(256, 128, 64, 32)) -> None:
         super().__init__()
 
+        if len(sizes) == 0:
+            raise ValueError("ImageDecoder sizes must contain at least one channel width.")
+        
         c, h, w = image_dims
+
+        # create conv layers
+        conv_layers = []
+        in_ch = sizes[0]
+        for out_ch in sizes[1:-1]:
+            conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1))
+            conv_layers.append(nn.GELU())
+            conv_layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+            in_ch = out_ch
+        out_ch = sizes[-1]
+        conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1))
+        conv_layers.append(nn.GELU())
+        conv_layers.append(nn.Upsample(size=(h, w), mode='bilinear', align_corners=False))
+        conv_layers.append(nn.Conv2d(out_ch, c, kernel_size=3, stride=1, padding=1))
+
         self.output_proj = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.GELU(),
-            nn.Linear(d_model * 2, 128 * 8 * 8),
+            nn.Linear(d_model * 2, sizes[0] * 4 * 4),
             nn.GELU(),
-            nn.Unflatten(1, (128, 8, 8)),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Upsample(size=(h, w), mode='bilinear', align_corners=False),
-            nn.Conv2d(32, c, kernel_size=3, stride=1, padding=1),
+            nn.Unflatten(1, (sizes[0], 4, 4)),
+            *conv_layers,
             nn.Sigmoid(),
         )
     
@@ -155,11 +174,60 @@ class ResidualBlock2D(nn.Module):
         return h + self.skip(x)
 
 
+class CrossAttention2D(nn.Module):
+    '''Cross-attention between UNet spatial features (B, C, H, W) and a context sequence (B, T, D).'''
+
+    def __init__(self, query_dim: int, context_dim: int, heads: int=4, 
+                 context_dropout: float=0.1) -> None:
+        super().__init__()
+        
+        assert query_dim % heads == 0
+        self.heads = heads
+        self.head_dim = query_dim // heads
+        self.norm = nn.GroupNorm(8, query_dim)
+        self.context_norm = nn.LayerNorm(context_dim)
+        self.context_dropout = nn.Dropout(context_dropout)
+        self.to_q = nn.Linear(query_dim, query_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, query_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, query_dim, bias=False)
+        self.to_out = nn.Linear(query_dim, query_dim)
+
+        # start as FiLM-only UNet and learn attention contribution gradually
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def process_for_attention(self, x: Tensor) -> Tensor:
+        return x.unflatten(-1, (self.heads, self.head_dim)).permute(0, 2, 1, 3)
+
+    def forward(self, x: Tensor, context: Tensor) -> Tensor:
+        context = self.context_dropout(self.context_norm(context))
+
+        # compute queries from spatial features and keys/values from context sequence
+        B, C, H, W = x.shape
+        h = self.norm(x).view(B, C, H * W).permute(0, 2, 1)   # (B, HW, C)
+        q = self.to_q(h)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        # reshape for multi-head attention and compute scaled dot-product attention
+        q = self.process_for_attention(q)
+        k = self.process_for_attention(k)
+        v = self.process_for_attention(v)
+
+        # compute attention and reshape back to (B, C, H, W)
+        out = F.scaled_dot_product_attention(q, k, v)   # (B, heads, HW, head_dim)
+        out = out.permute(0, 2, 1, 3).flatten(-2)       # (B, HW, C)
+        out = self.to_out(out).permute(0, 2, 1).view(B, C, H, W)
+
+        # combine attention output with original features using a learnable gate
+        return x + self.gate * out
+
+
 class ConditionalUNet2D(nn.Module):
     '''A UNet for 2D image states, conditioned on a (d_model,) embedding.'''
 
     def __init__(self, in_channels: int, cond_dim: int, base_dim: int=32,
-                 dim_mults: Tuple[int, ...]=(1, 2, 4)) -> None:
+                 dim_mults: Tuple[int, ...]=(1, 2, 4), 
+                 use_cross_attention: bool=True, nheads: int=4) -> None:
         super().__init__()
 
         # compute the embedding dimension for the conditioning MLPs
@@ -196,6 +264,8 @@ class ConditionalUNet2D(nn.Module):
         # bottleneck residual blocks
         mid_dim = dims[-1]
         self.mid1 = ResidualBlock2D(mid_dim, mid_dim, emb_dim)
+        self.cross_attn_mid = CrossAttention2D(mid_dim, cond_dim, heads=nheads) \
+            if use_cross_attention else None
         self.mid2 = ResidualBlock2D(mid_dim, mid_dim, emb_dim)
 
         # create the upsampling blocks of the UNet
@@ -218,8 +288,17 @@ class ConditionalUNet2D(nn.Module):
         self.out_conv = nn.Conv2d(dims[0], in_channels, kernel_size=3, padding=1)
 
     def forward(self, x: Tensor, t: Tensor, cond: Tensor) -> Tensor:
+        
+        # sequence conditioning uses the latest token for FiLM and full history for cross-attention
+        if cond.ndim == 3:
+            cond_last = cond[:, -1]
+            context = cond
+        else:
+            cond_last = cond
+            context = None
+
         # compute the conditioning embedding
-        emb = self.time_mlp(t) + self.cond_mlp(cond)
+        emb = self.time_mlp(t) + self.cond_mlp(cond_last)
 
         # forward pass through the UNet
         h = self.in_conv(x)
@@ -232,6 +311,8 @@ class ConditionalUNet2D(nn.Module):
 
         # bottleneck
         h = self.mid1(h, emb)
+        if self.cross_attn_mid is not None and context is not None:
+            h = self.cross_attn_mid(h, context)
         h = self.mid2(h, emb)
 
         # forward pass through upsampling path with skip connections
@@ -255,7 +336,7 @@ class DiffusionDecoder(nn.Module):
 
     def __init__(self, state_dim: Union[int, Tuple[int, ...]], d_model: int,
                  n_diffusion_steps: int=128, hidden_dim: int=32,
-                 clamp_output: bool=True) -> None:
+                 clamp_output: bool=True, use_cross_attention: bool=True) -> None:
         super().__init__()
 
         if not isinstance(state_dim, tuple):
@@ -266,9 +347,11 @@ class DiffusionDecoder(nn.Module):
         self.state_shape = tuple(state_dim)
         self.n_diffusion_steps = n_diffusion_steps
         self.clamp_output = clamp_output
+        self.condition_mode = 'sequence' if use_cross_attention else 'last'
 
         self.denoiser = ConditionalUNet2D(
-            in_channels=self.state_shape[0], cond_dim=d_model, base_dim=hidden_dim)
+            in_channels=self.state_shape[0], cond_dim=d_model, base_dim=hidden_dim, 
+            use_cross_attention=use_cross_attention)
 
         betas = self.cosine_beta_schedule(n_diffusion_steps)
         alphas = 1.0 - betas
@@ -319,22 +402,28 @@ class DiffusionDecoder(nn.Module):
     def forward(self, cond: Tensor) -> Tensor:
         '''Generates an image by iteratively denoising from pure noise, conditioned on the input 
         embedding.'''
+        # sample pure noise x_T
         batch = cond.size(0)
         x_t = torch.randn(batch, *self.state_shape, device=cond.device)
         
+        # denoise until we reach x_0
         for i in reversed(range(self.n_diffusion_steps)):
+
+            # sample noise prediction for current timestep
             t = torch.full((batch,), i, device=cond.device, dtype=torch.long)
             eps_pred = self.denoiser(x_t, t, cond)
 
+            # compute the mean prediction for the denoised sample x_t
             beta_t = self.extract(self.betas, t, x_t.ndim)
             sqrt_omb_t = self.extract(self.sqrt_one_minus_alpha_bars, t, x_t.ndim)
             sqrt_inv_a_t = self.extract(self.sqrt_recip_alphas, t, x_t.ndim)
-
             x_t = sqrt_inv_a_t * (x_t - (beta_t / sqrt_omb_t) * eps_pred)
+
+            # add noise for all but the final step
             if i > 0:
-                noise = torch.randn_like(x_t)
-                x_t = x_t + torch.sqrt(beta_t) * noise
+                x_t = x_t + torch.sqrt(beta_t) * torch.randn_like(x_t)
 
         if self.clamp_output:
             x_t = x_t.clamp(0.0, 1.0)
         return x_t
+
