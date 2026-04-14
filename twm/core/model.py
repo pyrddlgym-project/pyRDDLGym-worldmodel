@@ -81,7 +81,7 @@ class WorldModel(nn.Module):
 
         # positional encoding
         if use_absolute_pe:
-            self.pe = SinePositionalEncoding(d_model, max_len=seq_len)
+            self.pe = SinePositionalEncoding(d_model, max_len=seq_len + 1)
         else:
             self.pe = nn.Identity()
         self.embed_dropout = nn.Dropout(dropout)
@@ -95,7 +95,7 @@ class WorldModel(nn.Module):
                 dropout=dropout,
                 batch_first=True,
                 norm_first=norm_first,
-                max_len=seq_len,
+                max_len=seq_len + 1,
             )
         else:
             encoder_layer = nn.TransformerEncoderLayer(
@@ -166,8 +166,10 @@ class WorldModel(nn.Module):
         pad_mask = self.make_padding_mask(pad_lens, seq_len)  # (batch, seq_len)
         x[pad_mask] = self.pad_token
 
-        # mark first timestep with a learnable SOS embedding
-        x[:, 0] = x[:, 0] + self.sos_token
+        # prepend a dedicated SOS timestep
+        sos = self.sos_token.view(1, 1, -1).expand(batch, 1, -1)
+        x = torch.cat([sos, x], dim=1)
+        seq_len = seq_len + 1
 
         # positional encoding and transformer
         x = self.pe(x)
@@ -384,6 +386,7 @@ class RolloutContext:
     def reset(self, init_states: Tensor, init_actions: Tensor) -> None:
         '''Resets the rollout context with initial states and actions.'''
         batch, init_len = init_states.shape[:2]
+        assert init_len >= 1, 'RolloutContext.reset requires at least one initial timestep.'
         self.states = self.make_padded(init_states, self.seq_len)
         self.actions = self.make_padded(init_actions, self.seq_len)
         init_pad = max(0, self.seq_len - init_len)
