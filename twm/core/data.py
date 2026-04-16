@@ -7,7 +7,10 @@ import random
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Callable, Dict, Generator, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple
+
+Tensor = torch.Tensor
+TensorDict = Dict[str, Tensor]
 
 Array = np.ndarray
 ArrayDict = Dict[str, Array]
@@ -20,15 +23,6 @@ PLOTS_PATH = os.path.join(PARENT_PATH, 'plots')
 
 # <------------------------------- Data collection  ------------------------------>
 
-def dict_to_tensor(state_dict: ArrayDict) -> Array:
-    '''Converts a dict of arrays into a single concatenated array.'''
-    state_vec = []
-    for value in state_dict.values():
-        value = np.asarray(value, dtype=np.float32)
-        state_vec.append(np.ravel(value))
-    return np.concatenate(state_vec)
-
-
 def image_to_tensor(img: Image.Image, size: Tuple[int, int]=(64, 64)) -> Array:
     '''Converts a PIL image into a normalized tensor.'''
     img = img.resize(size, Image.Resampling.BILINEAR)
@@ -36,20 +30,25 @@ def image_to_tensor(img: Image.Image, size: Tuple[int, int]=(64, 64)) -> Array:
     return np.transpose(x, (2, 0, 1))
 
 
+def dict_append(src: Dict[str, Any], dest: Dict[str, List[Any]]) -> None:
+    '''Appends src arrays to dest arrays along the first dimension.'''
+    for key, value in src.items():
+        dest.setdefault(key, []).append(np.asarray(value))
+
+
 def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: str, 
-                       state_map: Callable[[ArrayDict], Array]=dict_to_tensor, 
-                       action_map: Callable[[ArrayDict], Array]=dict_to_tensor, 
                        render: bool=False) -> None:
     '''Collects vector data by running a policy in an environment, and saves it to a file.'''
     episodes = int(episodes)
     max_steps = int(max_steps)
 
     # collect data
-    states, actions, rewards, dones, next_states = [], [], [], [], []
+    states, actions, next_states, rewards, dones = {}, {}, {}, [], []
     
     for _ in (pbar := tqdm(range(episodes), desc="Collecting data")):
         state, _ = env.reset()
         total_reward = 0.
+
         for step in range(max_steps):
             if render:
                 env.render()
@@ -59,11 +58,11 @@ def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: st
             total_reward += reward
             done = term or trunc or step == max_steps - 1
             
-            states.append(state_map(state))
-            actions.append(action_map(action))
+            dict_append(state, states)
+            dict_append(action, actions)
+            dict_append(next_state, next_states)
             rewards.append(float(reward))
             dones.append(done)
-            next_states.append(state_map(next_state))
             
             state = next_state
             if done:
@@ -72,11 +71,11 @@ def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: st
     
     # save data
     data = {
-        "states":      np.array(states),
-        "actions":     np.array(actions),
+        "states":      {k: np.array(v) for k, v in states.items()},
+        "actions":     {k: np.array(v) for k, v in actions.items()},
+        "next_states": {k: np.array(v) for k, v in next_states.items()},
         "rewards":     np.array(rewards),
         "dones":       np.array(dones),
-        "next_states": np.array(next_states),
     }
     
     with open(os.path.join(DATA_PATH, data_name), "wb") as f:
@@ -84,32 +83,32 @@ def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: st
 
 
 def create_image_data(env, policy, episodes: int, max_steps: int, data_name: str, 
-                      image_map: Callable[[Image.Image], Array]=image_to_tensor, 
-                      action_map: Callable[[ArrayDict], Array]=dict_to_tensor) -> None:
+                      image_map: Callable[[Image.Image], Array]=image_to_tensor) -> None:
     '''Collects image data by running a policy in an environment, and saves it to a file.
     Uses the environment's render function to get image observations.'''
     episodes = int(episodes)
     max_steps = int(max_steps)
 
     # collect data
-    states, actions, rewards, dones, next_states = [], [], [], [], []
+    states, actions, next_states, rewards, dones = {}, {}, {}, [], []
     
     for _ in (pbar := tqdm(range(episodes), desc="Collecting data")):
         state, _ = env.reset()
-        obs = image_map(env.render())
+        obs = {'obs': image_map(env.render())}
         total_reward = 0.
+
         for step in range(max_steps):
             action = policy.sample_action(state)
             next_state, reward, term, trunc, _ = env.step(action)
-            next_obs = image_map(env.render())
+            next_obs = {'obs': image_map(env.render())}
             total_reward += reward
             done = term or trunc or step == max_steps - 1
 
-            states.append(obs)
-            actions.append(action_map(action))
+            dict_append(obs, states)
+            dict_append(action, actions)
+            dict_append(next_obs, next_states)
             rewards.append(float(reward))
             dones.append(done)
-            next_states.append(next_obs)
             
             state, obs = next_state, next_obs
             if done:
@@ -118,11 +117,11 @@ def create_image_data(env, policy, episodes: int, max_steps: int, data_name: str
     
     # save data
     data = {
-        "states":      np.array(states),
-        "actions":     np.array(actions),
+        "states":      {k: np.array(v) for k, v in states.items()},
+        "actions":     {k: np.array(v) for k, v in actions.items()},
+        "next_states": {k: np.array(v) for k, v in next_states.items()},
         "rewards":     np.array(rewards),
         "dones":       np.array(dones),
-        "next_states": np.array(next_states),
     }
     
     with open(os.path.join(DATA_PATH, data_name), "wb") as f:
@@ -131,7 +130,7 @@ def create_image_data(env, policy, episodes: int, max_steps: int, data_name: str
 
 # <------------------------------- Data preparation  ------------------------------>
 
-def load_episodic_data(data_name: str) -> Generator[ArrayDict, None, None]:
+def load_episodic_data(data_name: str) -> Generator[Dict[str, Any], None, None]:
     '''Loads data from a file and yields it as individual episode dicts.'''
     with open(os.path.join(DATA_PATH, data_name), "rb") as f:
         data = pickle.load(f)
@@ -142,18 +141,14 @@ def load_episodic_data(data_name: str) -> Generator[ArrayDict, None, None]:
     
     # split data into episodes
     for start, end in zip(ep_starts, ep_ends):
-        states_ep = data['states'][start:end]
-        actions_ep = data['actions'][start:end]
-        rewards_ep = data['rewards'][start:end]
         dones_ep = data['dones'][start:end]  
-        next_states_ep = data['next_states'][start:end] 
         assert dones_ep[-1] and np.all(~dones_ep[:-1])
         yield {
-            "states":      states_ep,
-            "actions":     actions_ep,
-            "rewards":     rewards_ep,
+            "states":      {k: v[start:end] for k, v in data['states'].items()},
+            "actions":     {k: v[start:end] for k, v in data['actions'].items()},
+            "next_states": {k: v[start:end] for k, v in data['next_states'].items()},
+            "rewards":     data['rewards'][start:end],
             "dones":       dones_ep,
-            "next_states": next_states_ep,
             'len':         end - start,
         }
 
@@ -161,49 +156,41 @@ def load_episodic_data(data_name: str) -> Generator[ArrayDict, None, None]:
 class SequenceDataset(torch.utils.data.Dataset):
     '''A PyTorch Dataset that takes episodic data and returns padded sequences of a specified length.'''
 
-    def __init__(self, episodes, seq_len: int, obs_idx=None,
+    def __init__(self, episodes, seq_len: int, obs_states: Optional[Set[str]]=None,
                  augment_starts: bool=False, min_frames: int=2) -> None:
         self.seq_len = seq_len
+        if obs_states is None:
+            obs_states = set(episodes[0]['states'].keys())
+        self.obs_states = set(obs_states)
         self.augment_starts = augment_starts
         self.min_frames = max(1, int(min_frames))
-        self.obs_idx = np.array(obs_idx) if obs_idx is not None else None
-
+        
         # store raw per-episode arrays and build a flat (ep_idx, t) sample index        
-        self._episodes, self._index = self.init_episodes(episodes, obs_idx)
-        sample_states = self._episodes[0]['states']
-        if sample_states.ndim > 2:
-            self.state_dim = tuple(sample_states.shape[1:])
-        else:
-            self.state_dim = sample_states.shape[1]
-        self.action_dim = self._episodes[0]['actions'].shape[-1]
+        self._episodes, self._index = SequenceDataset.init_episodes(episodes, self.obs_states)
+        self.state_dims = {k: v.shape[1:] for k, v in self._episodes[0]['states'].items()}
+        self.action_dims = {k: v.shape[1:] for k, v in self._episodes[0]['actions'].items()}
+        self.input_dims = {**self.state_dims, **self.action_dims}
 
         # calculate data set stats for normalization
-        self.state_mean, self.state_std, self.action_mean, self.action_std = self.init_stats(
-            self._episodes)
+        self.normalizer_stats = SequenceDataset.init_stats(self._episodes)
 
     # <------------------------------- Data preparation  ------------------------------>
 
     @staticmethod
-    def init_episodes(episodes, obs_idx=None):
-        '''Processes raw episode data, optionally selecting a subset of state dimensions, and builds 
-        a flat (ep_idx, t) sample index.'''
+    def init_episodes(episodes, obs_states: Set[str]):
+        '''Processes raw episode data, optionally selecting a subset of states, and builds a flat 
+        (ep_idx, t) sample index.'''
         new_episodes, index = [], []
 
         for ep_idx, ep in enumerate(episodes):
-            states = ep['states']
-            next_states = ep['next_states']
 
-            # optionally select only a subset of state dimensions to use as model input/targets
-            if obs_idx is not None:
-                states = np.take(states, obs_idx, axis=1)
-                next_states = np.take(next_states, obs_idx, axis=1)
-            
+            # optionally select only a subset of states to be returned by the dataset
             new_episodes.append({
-                'states':      states,
+                'states':      {k: v for k, v in ep['states'].items() if k in obs_states},
                 'actions':     ep['actions'],
+                'next_states': {k: v for k, v in ep['next_states'].items() if k in obs_states},
                 'rewards':     ep['rewards'],
                 'dones':       ep['dones'],
-                'next_states': next_states,
                 'len':         ep['len'],
             })
             
@@ -215,23 +202,28 @@ class SequenceDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def init_stats(episodes):
-        '''Calculates mean and std for states and actions across the entire dataset, for normalization.'''
-        states, actions = [], []
+        '''Calculates mean and std for states and actions across the entire dataset.'''
+        states, actions = {}, {}
         for ep in episodes:
-            states.append(ep['next_states'])
-            actions.append(ep['actions'])
+            dict_append(ep['next_states'], states)
+            dict_append(ep['actions'], actions)
 
         # calculate data set stats for state
-        states = torch.tensor(np.concatenate(states, axis=0), dtype=torch.float32)
-        state_mean = states.mean(dim=0)
-        state_std = states.std(dim=0).clamp(min=1e-8)
+        stats = {}
+        for key, values in states.items():
+            states_array = torch.tensor(np.concatenate(values, axis=0), dtype=torch.float32)
+            state_mean = states_array.mean(dim=0)
+            state_std = states_array.std(dim=0).clamp(min=1e-8)
+            stats[key] = (state_mean, state_std)
+        
+        # calculate data set stats for action       
+        for key, values in actions.items():
+            actions_array = torch.tensor(np.concatenate(values, axis=0), dtype=torch.float32)
+            action_mean = actions_array.mean(dim=0)
+            action_std = actions_array.std(dim=0).clamp(min=1e-8)
+            stats[key] = (action_mean, action_std)
 
-        # calculate data set stats for action
-        actions = torch.tensor(np.concatenate(actions, axis=0), dtype=torch.float32)
-        action_mean = actions.mean(dim=0)
-        action_std = actions.std(dim=0).clamp(min=1e-8)
-
-        return state_mean, state_std, action_mean, action_std
+        return stats
 
     # <------------------------------- Data sampling  ------------------------------>
 
@@ -258,37 +250,48 @@ class SequenceDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+    @staticmethod
+    def dict_of_float_tensor(value_dict: ArrayDict) -> TensorDict:
+        '''Converts a dict of numpy arrays into a dict of PyTorch tensors.'''
+        return {k: torch.tensor(v, dtype=torch.float32) for k, v in value_dict.items()}
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        '''Returns a padded sequence sample from the dataset at the given index.'''
         ep_idx, t = self._index[idx]
         ep = self._episodes[ep_idx]
         
         # get padded sequences of states, actions, rewards, dones, and next_states
-        states, pad = self.make_padded(ep['states'], t, self.seq_len)
-        actions, _ = self.make_padded(ep['actions'], t, self.seq_len)
+        states = {key: self.make_padded(arr, t, self.seq_len)[0]
+                  for key, arr in ep['states'].items()}
+        actions = {key: self.make_padded(arr, t, self.seq_len)[0]
+                   for key, arr in ep['actions'].items()}            
+        next_states = {k: v[t] for k, v in ep['next_states'].items()}
         rewards, _ = self.make_padded(ep['rewards'], t, self.seq_len)
-        dones, _ = self.make_padded(ep['dones'], t, self.seq_len)
-        next_states = ep['next_states'][t]
-
+        dones, pad = self.make_padded(ep['dones'], t, self.seq_len)
+        
         # HER-style: pick a random virtual start in [current_pad_len, seq_len-1]
         if self.augment_starts:
-            seq_len = states.shape[0]
+            seq_len = rewards.shape[0]
             max_pad = max(seq_len - self.min_frames, pad)
             new_pad = np.random.randint(pad, max_pad + 1)
             if new_pad > pad:
-                states = SequenceDataset.increase_padding(states, pad, new_pad)
-                actions = SequenceDataset.increase_padding(actions, pad, new_pad)
+                states = {k: SequenceDataset.increase_padding(v, pad, new_pad) 
+                          for k, v in states.items()}
+                actions = {k: SequenceDataset.increase_padding(v, pad, new_pad) 
+                           for k, v in actions.items()}
                 rewards = SequenceDataset.increase_padding(rewards, pad, new_pad)
                 dones = SequenceDataset.increase_padding(dones, pad, new_pad)
                 pad = new_pad
 
-        return (
-            torch.tensor(states, dtype=torch.float32),          # (context_len, state_dim...)
-            torch.tensor(actions, dtype=torch.float32),         # (context_len, action_dim,)
-            torch.tensor(rewards, dtype=torch.float32),         # (context_len,)
-            torch.tensor(dones, dtype=torch.bool),              # (context_len,)
-            torch.tensor(next_states, dtype=torch.float32),     # (state_dim...)
-            torch.tensor(pad, dtype=torch.long),                # (,)
-        )
+        # convert to PyTorch tensors and return
+        return {
+            "states":      SequenceDataset.dict_of_float_tensor(states),       # (seq_len, state_dims...)
+            "actions":     SequenceDataset.dict_of_float_tensor(actions),      # (seq_len, action_dims...)
+            "next_states": SequenceDataset.dict_of_float_tensor(next_states),  # (state_dims...)
+            "rewards":     torch.tensor(rewards, dtype=torch.float32),         # (seq_len,)
+            "dones":       torch.tensor(dones, dtype=torch.bool),              # (seq_len,)
+            "pad":         torch.tensor(pad, dtype=torch.long),                # ()
+        }
     
 
 def get_dataloader(data_name: str, seq_len: int, batch_size: int=64, test_split: float=0.1, 
@@ -318,16 +321,22 @@ def get_dataloader(data_name: str, seq_len: int, batch_size: int=64, test_split:
 
 # <------------------------------- Data visualization  ------------------------------>
 
-def plot_trajectories(trajectories, plot_name: str) -> None:
+def plot_trajectories(trajectories: List[TensorDict], plot_name: str) -> None:
     '''Plots trajectories of state variables over time and saves the plot to a file.'''
-    if isinstance(trajectories, torch.Tensor):
-        trajectories = trajectories.detach().cpu().numpy()
-
-    n_states = trajectories[0].shape[-1]
+    n_states = sum(int(np.prod(v.shape[1:], dtype=np.int64)) for v in trajectories[0].values())
     fig, axs = plt.subplots(1, n_states, figsize=(4 * n_states, 4), squeeze=False)
+    axs = axs.flat
+
     for traj in trajectories:
-        for j in range(n_states):
-            axs[0, j].plot(traj[:, j])
+        idx = 0
+        for key, value in traj.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            value = value.reshape(value.shape[0], -1)
+            for j in range(value.shape[1]):
+                axs[idx].plot(value[:, j])
+                idx += 1
+
     plt.savefig(os.path.join(PLOTS_PATH, plot_name))
     plt.close(fig)
 
@@ -340,16 +349,21 @@ def plot_data_trajectories(data_name: str, limit: int, plot_name: str) -> None:
     plot_trajectories(trajectories, plot_name)
 
 
-def save_video(render_fn, trajectories, plot_name: str) -> None:
+def save_video(render_fn, trajectories: List[TensorDict], plot_name: str) -> None:
     '''Saves a video of trajectories rendered by a provided function.'''
-    if isinstance(trajectories, torch.Tensor):
-        trajectories = trajectories.detach().cpu().numpy()
-    
     frames = []
     for trajectory in trajectories:
-        for state in trajectory:
-            frames.append(render_fn(state))
+        trajectory_np = {}
+        for k, v in trajectory.items():
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            trajectory_np[k] = v
 
+        n_steps = next(iter(trajectory_np.values())).shape[0]
+        for i in range(n_steps):
+            state = {k: v[i] for k, v in trajectory_np.items()}
+            frames.append(render_fn(state))
+    
     frames[0].save(
         fp=os.path.join(PLOTS_PATH, plot_name), 
         format='GIF', append_images=frames, save_all=True, duration=100)

@@ -2,11 +2,13 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import torch
-from torch import Tensor
-from typing import Optional, Dict, Tuple, Union
+from typing import Optional, Dict, Tuple
 from tqdm import tqdm
 
 from twm.core.model import WorldModel
+
+Tensor = torch.Tensor
+TensorDict = Dict[str, Tensor]
 
 
 class RolloutContext:
@@ -31,93 +33,113 @@ class RolloutContext:
         return torch.cat([x, padding], dim=1)
     
     @torch.no_grad()
-    def reset(self, init_states: Tensor, init_actions: Optional[Tensor]) -> None:
+    def reset(self, init_states: TensorDict, init_actions: Optional[TensorDict]) -> None:
         '''Resets the rollout context with initial states and actions.'''
         device = self.device
 
         # ensure batch dimension is present and get batch size and initial sequence length
-        batch, init_len = init_states.shape[:2]
+        batch, init_len = next(iter(init_states.values())).shape[:2]
         assert init_len >= 1, 'RolloutContext.reset requires at least one initial timestep.'
 
-        # extrcact only the observed state dimensions if obs_idx is set
-        init_states = init_states.to(device)
-        if self.model.obs_idx is not None:
-            assert len(init_states.shape) == 3, "State must be 3D tensor of shape (B, T, D)."
-            init_states = init_states[:, :, self.model.obs_idx]
-        
-        # pad initial states to required sequence length and store in context buffer
-        self.states = self.make_padded(init_states, self.seq_len)
+        # extract only the observed states, pad to required length and store in buffer
+        self.states = {}
+        for key, tensor in init_states.items():
+            if getattr(self.model, f'{key}_obs'):
+                tensor = tensor.to(device)
+                self.states[key] = self.make_padded(tensor, self.seq_len)
 
         # pad initial actions to required sequence length and store in context buffer
         if init_actions is None:
             assert init_len == 1, "Must pass single initial state."
-            self.actions = torch.zeros(batch, self.seq_len, self.model.action_dim, device=device)
+            self.actions = {k: torch.zeros(batch, self.seq_len, *shape, device=device) 
+                            for k, shape in self.model.action_dims.items()}
         else:
-            assert init_actions.shape[1] == init_len - 1, \
-                "Initial actions must have one less timestep than initial states."
-            init_actions = init_actions.to(device)
-            self.actions = self.make_padded(init_actions, self.seq_len)
-
+            self.actions = {}
+            for key, tensor in init_actions.items():
+                tensor = tensor.to(device)
+                self.actions[key] = self.make_padded(tensor, self.seq_len)
+                
         # calculate initial padding lengths based on the initial sequence length
         init_pad = max(0, self.seq_len - init_len)
         self.pad_lens = torch.full((batch,), init_pad, dtype=torch.long, device=device)
 
+    def index_into_last_epoch(self) -> Tuple[Tensor, Tensor]:
+        '''Calculates the indices into the last real state, accounting for padding.'''
+        last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
+        batch = next(iter(self.states.values())).size(0)
+        batch_idx = torch.arange(batch, device=self.device)
+        return batch_idx, last_real_idx
+
     @torch.no_grad()
-    def step(self, actions: Tensor) -> Tensor:
+    def step(self, actions: TensorDict) -> TensorDict:
         '''Performs a rollout step by feeding the current context into the model to predict 
         the next state, then updating the context with the new state and action.'''
         self.model.eval()
 
         # set actions at the last real token position for each batch item
-        last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
-        batch_idx = torch.arange(actions.size(0), device=self.device)
-        self.actions[batch_idx, last_real_idx] = actions
+        batch_idx, last_real_idx = self.index_into_last_epoch()
+        for key, tensor in actions.items():
+            self.actions[key][batch_idx, last_real_idx] = tensor
 
         # predict next state using the model
-        next_state = self.model.forward(
-            self.states, self.actions, self.pad_lens, latent=False, unnormalize=True)
-        
+        next_states = self.model.forward(
+            self.states, self.actions, self.pad_lens, return_latent=False, unnormalize=True)
+        assert isinstance(next_states, dict), "Model output should be a dict of state predictions."
+
         # for indices with padding, write next index directly into the buffer
         has_pad = self.pad_lens > 0
         if torch.any(has_pad):
             append_idx = last_real_idx[has_pad] + 1
-            self.states[has_pad, append_idx] = next_state[has_pad]
+            for key, next_state in next_states.items():
+                self.states[key][has_pad, append_idx] = next_state[has_pad]
         
         # for indices without padding, shift left and append at the end
         if torch.any(~has_pad):
-            self.states[~has_pad] = torch.roll(self.states[~has_pad], -1, dims=1)
-            self.states[~has_pad, -1] = next_state[~has_pad]
-            self.actions[~has_pad] = torch.roll(self.actions[~has_pad], -1, dims=1)
+            for key in self.states.keys():
+                self.states[key][~has_pad] = torch.roll(self.states[key][~has_pad], -1, dims=1)
+                self.states[key][~has_pad, -1] = next_states[key][~has_pad]
+            for key in self.actions.keys():
+                self.actions[key][~has_pad] = torch.roll(self.actions[key][~has_pad], -1, dims=1)
         
+        # reduce padding lengths by 1, ensuring they don't go below 0
         self.pad_lens = (self.pad_lens - 1).clamp(min=0)
 
-        return next_state
+        return next_states
     
     @torch.no_grad()
-    def rollout(self, init_states: Tensor, init_actions: Optional[Tensor], 
-                vec_policy, max_steps: int) -> Tensor:
+    def rollout(self, init_states: TensorDict, init_actions: Optional[TensorDict], 
+                vec_policy, max_steps: int) -> TensorDict:
         '''Performs a rollout using the world model and a given policy.'''
         device = self.device
 
+        # reset context with initial states and actions
         self.reset(init_states, init_actions)
-
-        trajectories = []
+        
+        # perform rollout steps, using the policy to select actions based on the last real state
+        trajectories = {}
         for _ in tqdm(range(max_steps), desc="Rollout"):
-            last_real_idx = (self.seq_len - self.pad_lens - 1).clamp(min=0)
-            batch_idx = torch.arange(self.states.size(0), device=device)
-            last_states = self.states[batch_idx, last_real_idx].detach().cpu().numpy()
-            actions = torch.tensor(vec_policy(last_states), dtype=torch.float32, device=device)
-            states = self.step(actions)
-            trajectories.append(states)
-        return torch.stack(trajectories).transpose(0, 1)
+
+            # extract the last real state for each batch item to feed into the policy
+            batch_idx, last_real_idx = self.index_into_last_epoch()
+            last_states_np = {k: v[batch_idx, last_real_idx].detach().cpu().numpy() 
+                              for k, v in self.states.items()}
+            
+            # use the policy to select the next action based on the last real state
+            actions = {k: torch.tensor(v, dtype=torch.float32, device=device) 
+                       for k, v in vec_policy(last_states_np).items()}
+            
+            # perform a rollout step with the selected actions to get the next states
+            for k, v in self.step(actions).items():
+                trajectories.setdefault(k, []).append(v.detach().cpu())
+
+        return {k: torch.stack(v, dim=1) for k, v in trajectories.items()}
 
 
 class WorldModelEnv(gym.Env):
     '''A gymnasium environment that uses a world model for state transitions.'''
 
     def __init__(self, world_model: WorldModel, reward_fn,
-                 initial_state: Union[Tensor, np.ndarray], 
-                 initial_actions: Optional[Tensor] = None, 
+                 initial_state: TensorDict, 
                  min_action: float=-1.0, max_action: float=1.0,
                  max_steps: int=200) -> None:
         '''Initializes the environment with a world model and initial state.'''
@@ -128,68 +150,80 @@ class WorldModelEnv(gym.Env):
         self.max_steps = max_steps
         self.device = world_model.device
         
-        # setup action and observation spaces
-        state_dim = world_model.state_dim
-        action_dim = world_model.action_dim
-        if isinstance(state_dim, tuple):
-            self.observation_space = spaces.Box(
-                low=0.0, high=1.0, shape=state_dim, dtype=np.float32)
+        # set up observation space
+        state_dims = world_model.state_dims
+        if world_model.visual:
+            assert 'obs' in state_dims, "Visual world model must have 'obs' in state dims."
+            assert len(state_dims) == 1, "Visual world model must only have 'obs' in state dims."
+            observation_space = spaces.Dict({
+                k: spaces.Box(low=0.0, high=1.0, shape=shape, dtype=np.float32)
+                for k, shape in state_dims.items()
+            })
         else:
-            self.observation_space = spaces.Box(
-                low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32)
-        
-        self.action_space = spaces.Box(
-            low=min_action, high=max_action, shape=(action_dim,), dtype=np.float32)
-        
+            observation_space = spaces.Dict({
+                k: spaces.Box(low=-np.inf, high=np.inf, shape=shape, dtype=np.float32)
+                for k, shape in state_dims.items()
+            })
+        self.observation_space = spaces.flatten_space(observation_space)
+
+        # set up action space
+        action_dims = world_model.action_dims
+        self._action_space = spaces.Dict({
+            k: spaces.Box(low=min_action, high=max_action, shape=shape, dtype=np.float32)
+            for k, shape in action_dims.items()
+        })
+        self.action_space = spaces.flatten_space(self._action_space)
+
         # process and store initial state
-        if isinstance(initial_state, np.ndarray):
-            initial_state = torch.from_numpy(initial_state).float().to(self.device)
-        if initial_state.dim() == 1:
-            initial_state = initial_state.unsqueeze(0)  # (1, state_dim)
-        if initial_state.dim() == 2:
-            initial_state = initial_state.unsqueeze(1)  # (1, 1, state_dim)
-        self.initial_state = initial_state
-        
-        # process and store initial actions if provided
-        if initial_actions is not None:
-            if isinstance(initial_actions, np.ndarray):
-                initial_actions = torch.from_numpy(initial_actions).float().to(self.device)
-            if initial_actions.dim() == 1:
-                initial_actions = initial_actions.unsqueeze(0)  # (1, action_dim)
-            if initial_actions.dim() == 2:
-                initial_actions = initial_actions.unsqueeze(1)  # (1, 1, action_dim)
-        self.initial_actions = initial_actions 
+        self.initial_state = {}
+        for key, value in initial_state.items():
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value).float()
+            self.initial_state[key] = value.to(self.device)[None, None]   # (1, 1, state_dims...)
+        self.initial_action = None
 
         # Initialize rollout context
         self.rollout = RolloutContext(world_model)
 
-    def reset(self, seed: Optional[int] = None, 
-              options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
         '''Resets the environment with a new initial state.'''
-        self.rollout.reset(self.initial_state, self.initial_actions)
-        last_real_idx = (self.rollout.seq_len - self.rollout.pad_lens - 1).clamp(min=0)
-        batch_idx = torch.arange(self.rollout.states.size(0), device=self.device)
-        self.obs = self.rollout.states[batch_idx, last_real_idx].squeeze().detach().cpu().numpy()
+        # reset the rollout context with the initial state and action
+        self.rollout.reset(self.initial_state, self.initial_action)
         self.step_num = 0
-        return self.obs, {}
 
-    def step(self, action: Union[np.ndarray, Tensor]) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        # extract the last real state for each batch item to return as initial obs
+        batch_idx, last_real_idx = self.rollout.index_into_last_epoch()
+        states_np = {key: tensor[batch_idx, last_real_idx][0].detach().cpu().numpy() 
+                     for key, tensor in self.rollout.states.items()}
+        self.states_np = states_np
+        
+        # flatten the observation dict into a single array for the observation space
+        obs = spaces.flatten(self.observation_space, states_np)
+        return obs, {}
+
+    def step(self, action: np.ndarray):
         '''Performs one step in the environment.'''
-        if isinstance(action, np.ndarray):
-            action = torch.from_numpy(action).float()
-        action = action.to(self.device)
-        if action.dim() == 1:
-            action = action.unsqueeze(0)  # (1, action_dim)
+        # unflatten the action array into a dict of action tensors
+        action_dict = {}
+        action_dict_np = {}
+        for key, array in spaces.unflatten(self._action_space, action).items():
+            if isinstance(array, np.ndarray):
+                array = torch.from_numpy(array).float()
+            action_dict[key] = array.to(self.device)[None]   # (1, action_dims...)
+            action_dict_np[key] = array.detach().cpu().numpy()
         
         # use rollout context to predict next state
-        prev_obs = self.obs
-        self.obs = self.rollout.step(action).squeeze().detach().cpu().numpy()
+        prev_states_np = self.states_np
+        states_np = {key: tensor[0].detach().cpu().numpy() 
+                     for key, tensor in self.rollout.step(action_dict).items()}
+        self.states_np = states_np
+        obs = spaces.flatten(self.observation_space, states_np)
         
         # use reward function to evaluate reward
-        reward = self.reward_fn(prev_obs, action.squeeze().detach().cpu().numpy(), self.obs)
+        reward = self.reward_fn(prev_states_np, action_dict_np, states_np)
         self.step_num += 1
         trunc = self.step_num >= self.max_steps
-        return self.obs, reward, False, trunc, {}
+        return obs, reward, False, trunc, {}
 
     def render(self) -> None:
         '''Renders the environment (not implemented).'''
