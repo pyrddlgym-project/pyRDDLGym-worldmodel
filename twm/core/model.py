@@ -275,7 +275,7 @@ class WorldModel(nn.Module):
 
         # compute loss across all state keys and sum
         loss = torch.tensor(0., device=device)
-        for key in self.state_dims.keys():
+        for key in targets.keys():
             loss += self.loss_fn(preds[key], targets[key])
         return loss
     

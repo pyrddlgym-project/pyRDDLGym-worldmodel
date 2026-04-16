@@ -44,20 +44,23 @@ class RolloutContext:
         # extract only the observed states, pad to required length and store in buffer
         self.states = {}
         for key, tensor in init_states.items():
-            if getattr(self.model, f'{key}_obs'):
+            if getattr(self.model, f'{key}_obs', False):
                 tensor = tensor.to(device)
                 self.states[key] = self.make_padded(tensor, self.seq_len)
 
         # pad initial actions to required sequence length and store in context buffer
         if init_actions is None:
             assert init_len == 1, "Must pass single initial state."
-            self.actions = {k: torch.zeros(batch, self.seq_len, *shape, device=device) 
+            self.actions = {k: torch.zeros(batch, self.seq_len, *shape, device=device)
                             for k, shape in self.model.action_dims.items()}
         else:
             self.actions = {}
-            for key, tensor in init_actions.items():
-                tensor = tensor.to(device)
-                self.actions[key] = self.make_padded(tensor, self.seq_len)
+            for key, shape in self.model.action_dims.items():
+                if key in init_actions:
+                    tensor = init_actions[key].to(device)
+                    self.actions[key] = self.make_padded(tensor, self.seq_len)
+                else:
+                    self.actions[key] = torch.zeros(batch, self.seq_len, *shape, device=device)
                 
         # calculate initial padding lengths based on the initial sequence length
         init_pad = max(0, self.seq_len - init_len)
@@ -150,8 +153,12 @@ class WorldModelEnv(gym.Env):
         self.max_steps = max_steps
         self.device = world_model.device
         
-        # set up observation space
-        state_dims = world_model.state_dims
+        # set up observation space using only states marked as observed in the model
+        state_dims = {k: v for k, v in world_model.state_dims.items()
+                      if bool(getattr(world_model, f'{k}_obs'))}
+        if len(state_dims) == 0:
+            raise ValueError('WorldModelEnv requires at least one observed state key.')
+        
         if world_model.visual:
             assert 'obs' in state_dims, "Visual world model must have 'obs' in state dims."
             assert len(state_dims) == 1, "Visual world model must only have 'obs' in state dims."
@@ -164,7 +171,8 @@ class WorldModelEnv(gym.Env):
                 k: spaces.Box(low=-np.inf, high=np.inf, shape=shape, dtype=np.float32)
                 for k, shape in state_dims.items()
             })
-        self.observation_space = spaces.flatten_space(observation_space)
+        self._observation_space = observation_space
+        self.observation_space = spaces.flatten_space(self._observation_space)
 
         # set up action space
         action_dims = world_model.action_dims
@@ -198,7 +206,7 @@ class WorldModelEnv(gym.Env):
         self.states_np = states_np
         
         # flatten the observation dict into a single array for the observation space
-        obs = spaces.flatten(self.observation_space, states_np)
+        obs = spaces.flatten(self._observation_space, states_np)
         return obs, {}
 
     def step(self, action: np.ndarray):
@@ -217,7 +225,7 @@ class WorldModelEnv(gym.Env):
         states_np = {key: tensor[0].detach().cpu().numpy() 
                      for key, tensor in self.rollout.step(action_dict).items()}
         self.states_np = states_np
-        obs = spaces.flatten(self.observation_space, states_np)
+        obs = spaces.flatten(self._observation_space, states_np)
         
         # use reward function to evaluate reward
         reward = self.reward_fn(prev_states_np, action_dict_np, states_np)
