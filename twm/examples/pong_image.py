@@ -1,10 +1,10 @@
+from PIL import Image
 import numpy as np
 import torch
 import pyRDDLGym
 from pyRDDLGym.core.policy import BaseAgent
 
-from twm.core.data import create_vector_data, get_dataloader, \
-    plot_data_trajectories, plot_trajectories, save_video
+from twm.core.data import create_image_data, get_dataloader, image_to_tensor, save_video
 from twm.core.model import WorldModel
 from twm.core.eval import RolloutContext
 
@@ -33,8 +33,8 @@ class PongEnvWithRandomStarts:
     
     def render(self):
         return self.env.render()
-        
     
+
 class PongPolicy(BaseAgent):
 
     def sample_action(self, state):
@@ -49,41 +49,30 @@ class PongPolicy(BaseAgent):
 
 
 def vec_policy(states):
-    ball_y = states['ball-y'][:, 0]
-    paddle_y = states['paddle-y']
-    actions = np.zeros((len(states['ball-y']), 1), dtype=np.float32)
-    actions[ball_y < paddle_y + 0.05] = np.where(
-        np.random.rand((ball_y < paddle_y + 0.05).sum()) < 0.85, -1, 1)
-    actions[ball_y > paddle_y + 0.05] = np.where(
-        np.random.rand((ball_y > paddle_y + 0.05).sum()) < 0.85, 1, -1)
-    return {'move': actions}    
+    return {'move': np.random.choice([-1, 0, 1])}    
 
 
-def create_pong_data(episodes=500, max_steps=200, save_path='pong_data.pkl'):
+def create_pong_data(episodes=200, max_steps=200, save_path='pong_image_data.pkl'):
     env = PongEnvWithRandomStarts()
     policy = PongPolicy()
-    create_vector_data(env, policy, episodes, max_steps, save_path)
+    create_image_data(env, policy, episodes, max_steps, save_path)
 
 
-def plot_rollouts(model, batch_size=4):
+def plot_rollouts(model):
     env = PongEnvWithRandomStarts()
-
-    rollout_context = RolloutContext(model)
-    init_states = {k: torch.from_numpy(v).float().to('cuda')[None, None]
-                   for k, v in env.reset()[0].items()}
-    trajectories = rollout_context.rollout(init_states, None, vec_policy, max_steps=200)
-    trajectories = [{k: v[0].detach().cpu() for k, v in trajectories.items()}]
+    env.reset()
+    init_image = image_to_tensor(env.render())
+    init_state = {'obs': torch.from_numpy(init_image).float().to('cuda')[None, None]}
     
-    plot_data_trajectories('pong_data.pkl', batch_size, 'pong_data_rollouts.png')
-    plot_trajectories(trajectories, 'pong_model_rollouts.png')
+    rollout_context = RolloutContext(model)
+    trajectories = rollout_context.rollout(init_state, None, vec_policy, max_steps=200)
+    trajectories = [{k: v[0].detach().cpu() for k, v in trajectories.items()}]
 
     def render_fn(state_dict):
-        state = {'ball-x___b1': state_dict['ball-x'][0].item(),
-                 'ball-y___b1': state_dict['ball-y'][0].item(), 
-                 'paddle-y': state_dict['paddle-y'][0].item()}
-        return env._visualizer.render(state)
+        state_img = state_dict['obs'].transpose(1, 2, 0)
+        return Image.fromarray((state_img * 255).astype(np.uint8))
     save_video(render_fn, trajectories, 'pong_model_rollout.gif')
-    
+
 
 if __name__ == "__main__":
     # create_pong_data()
@@ -92,18 +81,16 @@ if __name__ == "__main__":
 
     if fit:
         train_loader, test_loader = get_dataloader(
-            'pong_data.pkl', seq_len, batch_size=64, 
-            obs_states=['ball-x', 'ball-y', 'paddle-y'], augment_starts=False
-        )
+            'pong_image_data.pkl', seq_len, batch_size=64, augment_starts=False)
         state_dims = train_loader.dataset.state_dims
         action_dims = train_loader.dataset.action_dims
    
-        model = WorldModel(state_dims, action_dims, visual=False, seq_len=seq_len).to('cuda')
-        model.fit(train_loader, lr=0.0007, epochs=600, test_data_loader=test_loader, 
-                  model_name='pong_world_model.pth')
+        model = WorldModel(state_dims, action_dims, visual=True, seq_len=seq_len).to('cuda')
+        model.fit(train_loader, epochs=300, lr=0.00001, test_data_loader=test_loader, 
+                  model_name='pong_image_world_model.pth')
     
     else:
-        model = WorldModel.load('pong_world_model.pth').to('cuda')
+        model = WorldModel.load('pong_image_world_model.pth').to('cuda')
         
         plot_rollouts(model)
     
