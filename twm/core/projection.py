@@ -111,7 +111,9 @@ class ImageEncoder(nn.Module):
             *conv_layers,
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
-            nn.Linear(sizes[-1] * 4 * 4, d_model),
+            nn.Linear(sizes[-1] * 4 * 4, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
         )
 
         # actions will be projected with an MLP and concatenated to the projected image embedding
@@ -139,7 +141,7 @@ class ImageDecoder(nn.Module):
     condition_mode = 'last'
 
     def __init__(self, image_dims: Tuple[int, int, int], d_model: int,
-                 sizes: Tuple[int, ...]=(128, 64, 32), min_value: float=1e-4) -> None:
+                 sizes: Tuple[int, ...]=(256, 128, 64, 32), min_value: float=1e-6) -> None:
         super().__init__()
         self.min_value = min_value
 
@@ -162,11 +164,10 @@ class ImageDecoder(nn.Module):
         conv_layers.append(nn.Upsample(size=(h, w), mode='bilinear', align_corners=False))
         conv_layers.append(nn.Conv2d(out_ch, c, kernel_size=3, stride=1, padding=1))
 
-        n_hidden = (d_model + sizes[0] * 4 * 4) // 2
         self.output_proj = nn.Sequential(
-            nn.Linear(d_model, n_hidden),
+            nn.Linear(d_model, d_model * 4),
             nn.GELU(),
-            nn.Linear(n_hidden, sizes[0] * 4 * 4),
+            nn.Linear(d_model * 4, sizes[0] * 4 * 4),
             nn.GELU(),
             nn.Unflatten(1, (sizes[0], 4, 4)),
             *conv_layers,
