@@ -15,9 +15,7 @@ TensorDict = Dict[str, Tensor]
 
 
 class RolloutContext:
-    ''''Context manager for performing rollouts with a world model. 
-    Maintains a sliding window of past states and actions to feed into the model for 
-    next state prediction.'''
+    ''''Context manager for performing rollouts with a world model.'''
 
     def __init__(self, model: WorldModel) -> None:
         self.model = model
@@ -46,12 +44,11 @@ class RolloutContext:
 
         # extract only the observed states, pad to required length and store in buffer
         self.states = {}
-        for key in self.model.state_dims:
-            if getattr(self.model, f'{key}_obs', False):    
-                if key not in init_states:
-                    raise ValueError(f'Missing initial state for observed key: {key}')
-                tensor = init_states[key].to(device)
-                self.states[key] = self.make_padded(tensor, self.seq_len)
+        for key in self.model.state_dims:   
+            if key not in init_states:
+                raise ValueError(f'Missing initial state for observed key: {key}')
+            tensor = init_states[key].to(device)
+            self.states[key] = self.make_padded(tensor, self.seq_len)
 
         # pad initial actions to required sequence length and store in context buffer
         if init_actions is None:
@@ -166,13 +163,12 @@ class WorldModelEnv(gym.Env):
         self.discrete_action_keys = set(discrete_action_keys or set())
 
         # determine which state keys are observed and build the observation space accordingly
-        self._observed_state_dims = self._collect_observed_state_dims()
         self._observation_space = self._build_observation_space()
         self.observation_space = spaces.flatten_space(self._observation_space)
 
         # build the action space based on the world model's action dimensions
         self.action_space, self._action_specs, self._action_mode = self._build_action_space(
-            min_action=min_action, max_action=max_action)
+            min_action, max_action)
 
         # prepare the initial state for the rollout context
         self.initial_state = self._prepare_initial_state(initial_state)
@@ -183,33 +179,21 @@ class WorldModelEnv(gym.Env):
 
     # <----------------------------------- build spaces ----------------------------------->
 
-    def _collect_observed_state_dims(self) -> Dict[str, Tuple[int, ...]]:
-        '''Collects the dimensions of the observed state keys based on the world model's state 
-        dimensions and observation flags.'''
-        state_dims = {
-            key: shape
-            for key, shape in self.world_model.state_dims.items()
-            if bool(getattr(self.world_model, f'{key}_obs'))
-        }
-        if len(state_dims) == 0:
-            raise ValueError('WorldModelEnv requires at least one observed state key.')
-        return state_dims
-
     def _build_observation_space(self) -> spaces.Dict:
         '''Builds the observation space based on the observed state dimensions.'''
         if self.world_model.visual:
-            assert 'obs' in self._observed_state_dims, \
+            assert 'obs' in self.world_model.state_dims, \
                 "Visual world model must have 'obs' in state dims."
-            assert len(self._observed_state_dims) == 1, \
+            assert len(self.world_model.state_dims) == 1, \
                 "Visual world model must only have 'obs' in state dims."
             return spaces.Dict({
                 key: spaces.Box(low=0.0, high=1.0, shape=shape, dtype=np.float32)
-                for key, shape in self._observed_state_dims.items()
+                for key, shape in self.world_model.state_dims.items()
             })
         else:
             return spaces.Dict({
                 key: spaces.Box(low=-np.inf, high=np.inf, shape=shape, dtype=np.float32)
-                for key, shape in self._observed_state_dims.items()
+                for key, shape in self.world_model.state_dims.items()
             })
 
     def _build_action_space(self, min_action: float, max_action: float
@@ -279,7 +263,7 @@ class WorldModelEnv(gym.Env):
     def _prepare_initial_state(self, initial_state: Union[TensorDict, ArrayDict]) -> TensorDict:
         '''Prepares the initial state by ensuring it has the required keys and converting to tensors.'''
         result = {}
-        for key in self._observed_state_dims:
+        for key in self.world_model.state_dims:
             if key not in initial_state:
                 raise ValueError(f'Missing initial state for key: {key}')
             value = initial_state[key]

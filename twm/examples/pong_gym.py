@@ -4,12 +4,13 @@ from stable_baselines3 import PPO
 
 from twm.core.model import WorldModel
 from twm.core.eval import WorldModelEnv
+from twm.core.plan import SimpleMPC
     
 
 def create_world_model_env():
-    world_model = WorldModel.load('pong_world_model.pth').to('cuda')
-    init_state = {'ball-x': np.array([0.5]), 'ball-y': np.array([0.5]), 
-                  'vel-x': np.array([0.0]), 'vel-y': np.array([0.0]), 'paddle-y': np.array([0.4])}
+    world_model = WorldModel.load('pong_world_model_8.pth').to('cuda')
+    print(world_model.seq_len)
+    init_state = {'ball-x': np.array([0.5]), 'ball-y': np.array([0.5]), 'paddle-y': np.array([0.4])}
     reward_fn = lambda s, a, ns: -ns['ball-x'][0]
     return WorldModelEnv(world_model, reward_fn=reward_fn, initial_state=init_state, 
                          min_action=-1.0, max_action=1.0, max_steps=200, 
@@ -56,7 +57,7 @@ def eval_rl_agent_in_env(env, model, episodes=10):
     print(f"Average reward over {episodes} episodes: {avg_reward:.3f}")
 
 
-def train_rl_agent(env, steps=10000, iters=20):
+def train_rl_agent(env, steps=20000, iters=20):
     model = PPO("MlpPolicy", env, verbose=1)
     for _ in range(iters):
         model.learn(total_timesteps=steps, reset_num_timesteps=False)
@@ -64,6 +65,12 @@ def train_rl_agent(env, steps=10000, iters=20):
         eval_rl_agent_in_env(PongVecEnv(), model)
         
 
+def train_mpc_agent():
+    rollout_env = create_world_model_env()
+    eval_env = PongVecEnv()
+    mpc = SimpleMPC(rollout_env, eval_env, lookahead=50)
+    mpc.run('pong_mpc.gif', save_frames=False, episodes=10)
+
+
 if __name__ == "__main__":
-    env = create_world_model_env()
-    train_rl_agent(env)
+    train_mpc_agent()

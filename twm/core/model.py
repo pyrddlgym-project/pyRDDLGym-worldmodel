@@ -115,7 +115,6 @@ class WorldModel(nn.Module):
         for key, shape in self.input_dims.items():
             self.register_buffer(f"{key}_mean", torch.zeros(shape))
             self.register_buffer(f"{key}_std", torch.ones(shape))
-            self.register_buffer(f"{key}_obs", torch.tensor(True, dtype=torch.bool))
             
     @property
     def device(self) -> torch.device:
@@ -129,18 +128,7 @@ class WorldModel(nn.Module):
         for key, (mean, std) in dataset.normalizer_stats.items():
             self.register_buffer(f"{key}_mean", mean.to(self.device))
             self.register_buffer(f"{key}_std", std.to(self.device))
-        for key in self.state_dims:
-            is_obs = torch.tensor(key in dataset.obs_states, dtype=torch.bool, device=self.device)
-            self.register_buffer(f"{key}_obs", is_obs)
         
-    def observed_inputs(self, inputs: TensorDict) -> TensorDict:
-        '''Removes unobservables from the input dict.'''
-        result = {}
-        for key, tensor in inputs.items():
-            if getattr(self, f"{key}_obs"):
-                result[key] = tensor
-        return result
-
     def normalize_inputs(self, inputs: TensorDict) -> TensorDict:
         '''Normalizes inputs using the dataset statistics.'''
         result = {}
@@ -204,7 +192,7 @@ class WorldModel(nn.Module):
     def encode_history(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor) -> Tensor:
         '''Encodes a history of states and actions into a sequence of latents using the transformer.'''
         # prepare states and actions and map to latent dimension space
-        states = self.observed_inputs(states)
+        states = {k: v for k, v in states.items() if k in self.state_dims}
         states = self.normalize_inputs(states)
         actions = self.normalize_inputs(actions)
         x = {**states, **actions}
@@ -268,7 +256,7 @@ class WorldModel(nn.Module):
         pad_lens = pad_lens.to(device)
         
         # normalize inputs as targets and get predictions
-        targets = self.observed_inputs(next_states)
+        targets = {k: v for k, v in next_states.items() if k in self.state_dims}
         targets = self.normalize_inputs(targets)
         preds = self.forward(states, actions, pad_lens, return_latent=False, unnormalize=False)
         assert isinstance(preds, dict), "Model output should be a dict of state predictions."
