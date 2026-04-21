@@ -5,8 +5,7 @@ from pyRDDLGym.core.policy import BaseAgent
 
 from twm.core.data import create_vector_data, get_dataloader, \
     plot_data_trajectories, plot_trajectories, save_video
-from twm.core.model import WorldModel
-from twm.core.eval import RolloutContext
+from twm.core.model import WorldModel, WorldModelEvaluator
 
 
 class PongEnvWithRandomStarts:
@@ -68,7 +67,7 @@ def create_pong_data(episodes=500, max_steps=200, save_path='pong_data.pkl'):
 def plot_rollouts(model, batch_size=4):
     env = PongEnvWithRandomStarts()
 
-    rollout_context = RolloutContext(model)
+    rollout_context = WorldModelEvaluator(model)
     init_states = {k: torch.from_numpy(v).float().to('cuda')[None, None]
                    for k, v in env.reset()[0].items()}
     trajectories = rollout_context.rollout(init_states, None, vec_policy, max_steps=200)
@@ -87,8 +86,8 @@ def plot_rollouts(model, batch_size=4):
 
 if __name__ == "__main__":
     # create_pong_data()
-    seq_len = 10
-    fit = True
+    seq_len = 8
+    fit = False
 
     if fit:
         train_loader, test_loader = get_dataloader(
@@ -99,11 +98,10 @@ if __name__ == "__main__":
         action_dims = train_loader.dataset.action_dims
    
         model = WorldModel(state_dims, action_dims, visual=False, seq_len=seq_len).to('cuda')
-        model.fit(train_loader, lr=0.0007, epochs=600, test_data_loader=test_loader, 
-                  model_name='pong_world_model.pth')
+        model.fit(train_loader, lr=0.001, epochs=1000, test_data_loader=test_loader, 
+                  model_name=f'pong_world_model_{seq_len}.pth')
     
     else:
-        model = WorldModel.load('pong_world_model.pth').to('cuda')
-        
+        model = WorldModel.load(f'pong_world_model_{seq_len}.pth').to('cuda')     
         plot_rollouts(model)
     

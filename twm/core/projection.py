@@ -5,7 +5,6 @@ from typing import Dict, Tuple
 
 Tensor = torch.Tensor
 TensorDict = Dict[str, Tensor]
-
 Shape = Tuple[int, ...]
 ShapeDict = Dict[str, Shape]
 
@@ -13,18 +12,19 @@ ShapeDict = Dict[str, Shape]
 # <------------------------------- Vector In and Out  ------------------------------>
 
 class VectorEncoder(nn.Module):
-    '''An MLP to encode vector states and actions into a (d_model,) embedding for the transformer.'''
+    '''An MLP to encode vector states and actions into a (d_model,) embedding for the 
+    transformer.'''
 
     def __init__(self, input_dims: ShapeDict, d_model: int) -> None:
         super().__init__()
 
         # total input dimension is the sum of all state and action dimensions
-        input_dim = sum(int(np.prod(shape, dtype=np.int64)) for shape in input_dims.values())
+        in_dim = sum(int(np.prod(shape, dtype=np.int64)) for shape in input_dims.values())
 
-        # simple MLP to project concatenated state and action vector into (d_model,) embedding
-        n_hidden = (input_dim + d_model) // 2
+        # simple MLP to project state and action vector into (d_model,) embedding
+        n_hidden = (in_dim + d_model) // 2
         self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, n_hidden),
+            nn.Linear(in_dim, n_hidden),
             nn.GELU(),
             nn.Linear(n_hidden, d_model)
         )
@@ -33,7 +33,7 @@ class VectorEncoder(nn.Module):
 
         # concatenate all state and action tensors into a single vector
         batch, seq_len = next(iter(input_dict.values())).shape[:2]
-        x = [tensor.view(batch, seq_len, -1) for tensor in input_dict.values()]
+        x = [v.view(batch, seq_len, -1) for v in input_dict.values()]
         x = torch.cat(x, dim=-1)
         x = x.view(batch * seq_len, -1)
 
@@ -44,7 +44,7 @@ class VectorEncoder(nn.Module):
 
 
 class VectorDecoder(nn.Module):
-    '''An MLP to decode a (d_model,) embedding back into vector states for the transformer.'''
+    '''An MLP to decode a (d_model,) embedding into vector states for the transformer.'''
 
     condition_mode = 'last'
 
@@ -53,18 +53,18 @@ class VectorDecoder(nn.Module):
 
         # total output dimension is the sum of all state dimensions
         self.state_dims = state_dims
-        state_dim = sum(int(np.prod(shape, dtype=np.int64)) for shape in state_dims.values())
+        s_dim = sum(int(np.prod(shape, dtype=np.int64)) for shape in state_dims.values())
 
         # simple MLP to project (d_model,) embedding back into state dict
-        n_hidden = (d_model + state_dim) // 2
+        n_hidden = (d_model + s_dim) // 2
         self.output_proj = nn.Sequential(
             nn.Linear(d_model, n_hidden),
             nn.GELU(),
-            nn.Linear(n_hidden, state_dim),
+            nn.Linear(n_hidden, s_dim),
         )
     
     def forward(self, x: Tensor) -> TensorDict:
-        assert x.dim() == 2, "Decoder input should be (batch, d_model)."
+        assert x.dim() == 2, 'Decoder input should be (batch, d_model).'
         next_state = self.output_proj(x)
 
         # split output vector back into state dict
@@ -87,16 +87,16 @@ class ImageEncoder(nn.Module):
         super().__init__()
 
         if len(sizes) == 0:
-            raise ValueError("ImageEncoder sizes must contain at least one channel width.")
+            raise ValueError('ImageEncoder sizes must not be empty.')
 
-        # for visual inputs, we expect a single key 'obs' in input_dims with shape (C, H, W)
-        # we will use a CNN to project this image input into the (d_model,) embedding space
+        # for visual inputs, we expect a single key 'obs' in input_dims of shape (C, H, W)
+        # we use a CNN to project this image input into the (d_model,) embedding space
         input_dims = dict(input_dims)
         if 'obs' not in input_dims:
-            raise ValueError("For visual inputs, input_dims should have key 'obs'.")
+            raise ValueError('For visual inputs, input_dims should have key "obs".')
         obs_shape = input_dims.pop('obs')
         if len(obs_shape) != 3:
-            raise ValueError("For visual inputs, input_dims['obs'] should be (C, H, W).")
+            raise ValueError('For visual inputs, input_dims["obs"] should be (C, H, W).')
         n_channels = obs_shape[0]
 
         # create conv layers
@@ -116,7 +116,7 @@ class ImageEncoder(nn.Module):
             nn.Linear(4 * d_model, d_model),
         )
 
-        # actions will be projected with an MLP and concatenated to the projected image embedding
+        # actions projected with an MLP and concatenated to the projected image embedding
         self.action_proj = VectorEncoder(input_dims, d_model)
     
     def forward(self, input_dict: TensorDict) -> Tensor:
@@ -136,7 +136,7 @@ class ImageEncoder(nn.Module):
 
 
 class ImageDecoder(nn.Module):
-    '''A CNN to decode a (d_model,) embedding back into images for the transformer output.'''
+    '''A CNN to decode a (d_model,) embedding into images for the transformer output.'''
 
     condition_mode = 'last'
 
@@ -146,7 +146,7 @@ class ImageDecoder(nn.Module):
         self.min_value = min_value
 
         if len(sizes) == 0:
-            raise ValueError("ImageDecoder sizes must contain at least one channel width.")
+            raise ValueError('ImageDecoder sizes must not be empty.')
         
         c, h, w = image_dims
 
@@ -175,7 +175,7 @@ class ImageDecoder(nn.Module):
         )
     
     def forward(self, x: Tensor) -> TensorDict:
-        assert x.dim() == 2, "Decoder input should be (batch, d_model)."
+        assert x.dim() == 2, 'Decoder input should be (batch, d_model).'
         img = self.output_proj(x)
         img = img.clamp(self.min_value, 1.0 - self.min_value)
         next_state = {'obs': img}

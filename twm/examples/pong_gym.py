@@ -3,8 +3,8 @@ import numpy as np
 from stable_baselines3 import PPO
 
 from twm.core.model import WorldModel
-from twm.core.eval import WorldModelEnv
-from twm.core.plan import SimpleMPC
+from twm.core.env import WorldModelEnv
+from twm.planners.simple import SimpleMPC
     
 
 def create_world_model_env():
@@ -69,8 +69,9 @@ def train_mpc_agent():
     rollout_env = create_world_model_env()
     eval_env = PongVecEnv()
     mpc = SimpleMPC(rollout_env, eval_env, lookahead=50)
-    mpc.run('pong_mpc.gif', save_frames=False, episodes=10)
+    mpc.run('pong_mpc.gif', save_frames=True, episodes=1)
 
 
 if __name__ == "__main__":
     train_mpc_agent()
+    

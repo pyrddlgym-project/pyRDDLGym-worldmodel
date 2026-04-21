@@ -5,8 +5,7 @@ import pyRDDLGym
 from pyRDDLGym.core.policy import BaseAgent
 
 from twm.core.data import create_image_data, get_dataloader, image_to_tensor, save_video
-from twm.core.model import WorldModel
-from twm.core.eval import RolloutContext
+from twm.core.model import WorldModel, WorldModelEvaluator
 
 
 class PongEnvWithRandomStarts:
@@ -52,7 +51,7 @@ def vec_policy(states):
     return {'move': np.random.choice([-1, 0, 1])}    
 
 
-def create_pong_data(episodes=200, max_steps=200, save_path='pong_image_data.pkl'):
+def create_pong_data(episodes=300, max_steps=200, save_path='pong_image_data.pkl'):
     env = PongEnvWithRandomStarts()
     policy = PongPolicy()
     create_image_data(env, policy, episodes, max_steps, save_path)
@@ -64,7 +63,7 @@ def plot_rollouts(model):
     init_image = image_to_tensor(env.render())
     init_state = {'obs': torch.from_numpy(init_image).float().to('cuda')[None, None]}
     
-    rollout_context = RolloutContext(model)
+    rollout_context = WorldModelEvaluator(model)
     trajectories = rollout_context.rollout(init_state, None, vec_policy, max_steps=200)
     trajectories = [{k: v[0].detach().cpu() for k, v in trajectories.items()}]
 
@@ -76,7 +75,7 @@ def plot_rollouts(model):
 
 if __name__ == "__main__":
     # create_pong_data()
-    seq_len = 10
+    seq_len = 8
     fit = True
 
     if fit:
@@ -87,10 +86,10 @@ if __name__ == "__main__":
    
         model = WorldModel(state_dims, action_dims, visual=True, seq_len=seq_len).to('cuda')
         model.fit(train_loader, epochs=300, lr=0.00001, test_data_loader=test_loader, 
-                  model_name='pong_image_world_model.pth')
+                  model_name=f'pong_image_world_model_{seq_len}.pth')
     
     else:
-        model = WorldModel.load('pong_image_world_model.pth').to('cuda')
+        model = WorldModel.load(f'pong_image_world_model_{seq_len}.pth').to('cuda')
         
         plot_rollouts(model)
     

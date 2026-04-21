@@ -7,37 +7,38 @@ Tensor = torch.Tensor
 
 
 class SinePositionalEncoding(nn.Module):
-    '''Implements absolute positional encoding as described in "Attention is All You Need".'''
+    '''Absolute positional encoding as described in "Attention is All You Need".'''
 
     def __init__(self, d_model: int, max_len: int=256, base: float=10000.0) -> None:
         super().__init__()
 
         position = torch.arange(max_len).unsqueeze(1)   # (max_len, 1)
         log_base = torch.log(torch.tensor(base))
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-log_base / d_model))  # (d_model / 2,)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-log_base / d_model))  
+        # (d_model / 2,)
         pe = torch.zeros(max_len, d_model)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+        self.register_buffer('pe', pe)
 
     def forward(self, x: Tensor) -> Tensor:
         return x + self.pe[:x.size(1)]   # (batch, seq_len, d_model)
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    '''Applies rotary positional embeddings to per-head query and key tensors.'''
+    '''Rotary positional embeddings to per-head query and key tensors.'''
 
     def __init__(self, head_dim: int, max_len: int=256, base: float=10000.0) -> None:
         super().__init__()
 
         if head_dim % 2 != 0:
-            raise ValueError(f"ROPE requires an even head dimension, got {head_dim}.")
+            raise ValueError(f'ROPE requires an even head dimension, got {head_dim}.')
 
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         positions = torch.arange(max_len, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
-        self.register_buffer("cos", freqs.cos(), persistent=False)
-        self.register_buffer("sin", freqs.sin(), persistent=False)
+        self.register_buffer('cos', freqs.cos(), persistent=False)
+        self.register_buffer('sin', freqs.sin(), persistent=False)
 
     def _rotate_half(self, x: Tensor) -> Tensor:
         x_even = x[..., 0::2]
@@ -63,10 +64,10 @@ class RotaryMultiheadAttention(nn.Module):
         super().__init__()
 
         if not batch_first:
-            raise ValueError("RotaryMultiheadAttention only supports batch_first=True.")
+            raise ValueError('RotaryMultiheadAttention only supports batch_first=True.')
         if embed_dim % num_heads != 0:
             raise ValueError(
-                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads}).")
+                f'embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads}).')
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -94,31 +95,27 @@ class RotaryMultiheadAttention(nn.Module):
                 attn_mask: Optional[Tensor]=None, average_attn_weights: bool=True,
                 is_causal: bool=False) -> Tuple[Tensor, Union[Tensor, None]]:
         if key_padding_mask is not None:
-            raise NotImplementedError("RotaryMultiheadAttention expects padding to be "
-                                      "encoded in attn_mask.")
+            raise NotImplementedError('RotaryMultiheadAttention expects padding to be '
+                                      'encoded in attn_mask.')
         if not self.batch_first:
-            raise ValueError("RotaryMultiheadAttention only supports batch_first=True.")
+            raise ValueError('RotaryMultiheadAttention only supports batch_first=True.')
 
         batch, query_len, _ = query.shape
         key_len = key.size(1)
 
-        q = F.linear(query, self.in_proj_weight[:self.embed_dim],
-                     None if self.in_proj_bias is None 
-                     else self.in_proj_bias[:self.embed_dim])
-        k = F.linear(key, self.in_proj_weight[self.embed_dim:2 * self.embed_dim],
-                     None if self.in_proj_bias is None 
-                     else self.in_proj_bias[self.embed_dim:2 * self.embed_dim])
-        v = F.linear(value, self.in_proj_weight[2 * self.embed_dim:],
-                     None if self.in_proj_bias is None 
-                     else self.in_proj_bias[2 * self.embed_dim:])
+        dim = self.embed_dim
+        bias, weight = self.in_proj_bias, self.in_proj_weight
+        q = F.linear(query, weight[:dim], None if bias is None else bias[:dim])
+        k = F.linear(key, weight[dim:2 * dim], None if bias is None else bias[dim:2 * dim])
+        v = F.linear(value, weight[2 * dim:], None if bias is None else bias[2 * dim:])
 
         q = q.view(batch, query_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch, key_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, key_len, self.num_heads, self.head_dim).transpose(1, 2)
         q, k = self.rotary(q, k)
 
-        if attn_mask is not None and attn_mask.dim() == 3 \
-                and attn_mask.size(0) == batch * self.num_heads:
+        if (attn_mask is not None and attn_mask.dim() == 3 and 
+                attn_mask.size(0) == batch * self.num_heads):
             attn_mask = attn_mask.view(batch, self.num_heads, query_len, key_len)
 
         if need_weights:
@@ -127,7 +124,7 @@ class RotaryMultiheadAttention(nn.Module):
             if attn_mask is not None:
                 attn_scores = attn_scores + attn_mask
             attn_weights = torch.softmax(attn_scores, dim=-1)
-            if self.training and self.dropout > 0.0:
+            if self.training and self.dropout > 0:
                 attn_weights = F.dropout(attn_weights, p=self.dropout)
             raw_output = torch.matmul(attn_weights, v)
             weights_out = attn_weights.mean(dim=1)  # (batch, query_len, key_len)
@@ -141,7 +138,7 @@ class RotaryMultiheadAttention(nn.Module):
             weights_out = None
 
         attn_output = raw_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch, query_len, self.embed_dim)
+        attn_output = attn_output.view(batch, query_len, dim)
         attn_output = self.out_proj(attn_output)
         return attn_output, weights_out
 
@@ -162,7 +159,7 @@ class RotaryTransformerEncoderLayer(nn.TransformerEncoderLayer):
         )
 
     def forward(self, src: Tensor, src_mask: Optional[Tensor]=None,
-                src_key_padding_mask: Optional[Tensor]=None,
+                src_key_padding_mask: Optional[Tensor]=None, 
                 is_causal: bool=False) -> Tensor:
         x = src
         if self.norm_first:
