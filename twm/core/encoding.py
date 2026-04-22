@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 Tensor = torch.Tensor
 
@@ -93,7 +93,7 @@ class RotaryMultiheadAttention(nn.Module):
     def forward(self, query: Tensor, key: Tensor, value: Tensor,
                 key_padding_mask: Optional[Tensor]=None, need_weights: bool=True,
                 attn_mask: Optional[Tensor]=None, average_attn_weights: bool=True,
-                is_causal: bool=False) -> Tuple[Tensor, Union[Tensor, None]]:
+                is_causal: bool=False) -> Tuple[Tensor, Tensor | None]:
         if key_padding_mask is not None:
             raise NotImplementedError('RotaryMultiheadAttention expects padding to be '
                                       'encoded in attn_mask.')

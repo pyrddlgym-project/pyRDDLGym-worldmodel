@@ -6,25 +6,34 @@ from tqdm import tqdm
 from typing import Tuple
 
 from twm.core.data import PLOTS_PATH
-from twm.core.env import WorldModelEnv
+from twm.core.env import DiscreteActionWrapper, WorldModelEnv
 
 
-class SimpleMPC:
-    '''Model-predictive control using a WorldModelEnv for action selection.'''
+class RandomShootingMPC:
+    '''Model-predictive controller for discrete action problems using random shooting.'''
 
     def __init__(self, rollout_env: WorldModelEnv, real_env: gym.Env, 
                  lookahead: int, num_parallel_evals: int=32) -> None:
         self.rollout_env = rollout_env
         self.real_env = real_env
         self.lookahead = lookahead
-        self.num_parallel_evals = int(num_parallel_evals)
-        self.actions = rollout_env.enumerated_actions
-
+        self.num_parallel_evals = num_parallel_evals
+        
+        self.actions = DiscreteActionWrapper.build_action_lut(self.rollout_env)
         self._obs_history = []     
         self._action_history = []  
 
-    def _build_init_tensors(self):
-        '''Build init_states and init_actions tensors from the history buffers.'''
+    def _repeat_tensor_dict(self, tensors):
+        '''Repeat a batched tensor dict along the batch dimension.'''
+        if self.num_parallel_evals == 1:
+            return tensors
+        return {
+            k: v.repeat(self.num_parallel_evals, *([1] * (v.ndim - 1)))
+            for k, v in tensors.items()
+        }
+
+    def _align_world_model(self):
+        '''Seed the WorldModelEnv with the full real-env history.'''
         wm = self.rollout_env
         device = wm.device
 
@@ -35,93 +44,79 @@ class SimpleMPC:
 
         # build init_states
         init_states = {}
-        for key in wm._observation_space.spaces:
-            stacked = np.stack([wm.obs_to_state_dict(o)[key] for o in obs_hist], axis=0)
-            init_states[key] = torch.from_numpy(stacked).float().unsqueeze(0).to(device)
+        for key in wm.world_model.env_spec.state_spec:
+            stacked = np.stack([obs[key] for obs in obs_hist], axis=0)
+            init_states[key] = torch.from_numpy(stacked).float().to(device)[None]
             
         # build init_actions: T-1 real actions + one zero pad
         init_actions = {}
-        for key, shape in wm.world_model.action_dims.items():
+        for key, spec in wm.world_model.env_spec.action_spec.items():
             if act_hist:
-                decoded = np.stack([wm.decode_action(a)[1][key] for a in act_hist], axis=0)
+                decoded = np.stack([wm.decode_action(a)[key] for a in act_hist], axis=0)
             else:
-                decoded = np.zeros((0, *shape), dtype=np.float32)
-            zero_pad = np.zeros((1, *shape), dtype=np.float32)
+                decoded = np.zeros((0, *spec.shape), dtype=np.float32)
+            zero_pad = np.zeros((1, *spec.shape), dtype=np.float32)
             combined = np.concatenate([decoded, zero_pad], axis=0)
-            init_actions[key] = torch.from_numpy(combined).float().unsqueeze(0).to(device)
+            init_actions[key] = torch.from_numpy(combined).float().to(device)[None]
             
         # repeat tensors along the batch dimension for parallel rollouts
-        init_states = self._repeat_tensor_dict(init_states, self.num_parallel_evals)
-        init_actions = self._repeat_tensor_dict(init_actions, self.num_parallel_evals)
-        return init_states, init_actions
+        init_states = self._repeat_tensor_dict(init_states)
+        init_actions = self._repeat_tensor_dict(init_actions)
 
-    @staticmethod
-    def _repeat_tensor_dict(tensors, batch_size):
-        '''Repeat a batched tensor dict along the batch dimension.'''
-        if batch_size == 1:
-            return tensors
-        return {
-            k: v.repeat(batch_size, *([1] * (v.ndim - 1)))
-            for k, v in tensors.items()
-        }
+        # bypass WorldModelEnv and set the rollout context directly
+        wm.rollout.reset(init_states, init_actions)
+        wm.step_num = 0
 
     def _decode_action_batch(self, actions):
         '''Decode a list of gym actions into batched model tensors and numpy arrays.'''
-        decoded = [self.rollout_env.decode_action(action) for action in actions]
+        wm = self.rollout_env
+        decoded_np = [wm.decode_action(action) for action in actions]
         action_tensors, action_arrays = {}, {}
-        for key in self.rollout_env.world_model.action_dims:
-            action_tensors[key] = torch.cat([item[0][key] for item in decoded], dim=0)
-            action_arrays[key] = np.stack([item[1][key] for item in decoded], axis=0)
+        for key in wm.world_model.env_spec.action_spec:
+            action = np.stack([item[key] for item in decoded_np], axis=0)
+            action_arrays[key] = action
+            action_tensors[key] = torch.from_numpy(action).float().to(wm.device)
         return action_tensors, action_arrays
 
-    def _batched_reward(self, prev_states_np, action_dict_np, states_np):
+    def _batched_reward(self, obs_dict, action_dict, next_obs_dict):
         '''Evaluate the reward function independently for each rollout in the batch.'''
-        rewards = np.empty(self.num_parallel_evals, dtype=np.float32)
+        rewards = np.zeros(self.num_parallel_evals, dtype=np.float32)
         for i in range(self.num_parallel_evals):
             rewards[i] = float(self.rollout_env.reward_fn(
-                {k: v[i] for k, v in prev_states_np.items()},
-                {k: v[i] for k, v in action_dict_np.items()},
-                {k: v[i] for k, v in states_np.items()},
+                {k: v[i] for k, v in obs_dict.items()},
+                {k: v[i] for k, v in action_dict.items()},
+                {k: v[i] for k, v in next_obs_dict.items()},
             ))
         return rewards
 
-    def _align_world_model(self):
-        '''Seed the WorldModelEnv's RolloutContext with the full real-env history.'''
-        wm = self.rollout_env
-        init_states, init_actions = self._build_init_tensors()
-
-        # bypass WorldModelEnv.reset() and set the rollout context directly
-        wm.rollout.reset(init_states, init_actions)
-        wm.step_num = 0
-        wm.states_np = wm.obs_to_state_dict(self._obs_history[-1])
-
     def _estimate_action_return(self, action):
         '''Estimate an action value with one or more rollout continuations.'''
-        wm = self.rollout_env
+        # align the world model's rollout context with the real environment's history
         self._align_world_model()
 
         actions = [action] * self.num_parallel_evals
         returns = np.zeros(self.num_parallel_evals, dtype=np.float32)
-        horizon = min(self.lookahead, wm.max_steps)
+        horizon = min(self.lookahead, self.rollout_env.max_steps)
 
         for step_idx in range(horizon):
 
             # get the batch of last observations from the rollout history
-            prev_states_np = wm.rollout.last_states(to_numpy=True)
+            obs_dict = self.rollout_env.rollout.last_states(to_numpy=True)
         
             # apply a batched step in the world model with the current batch of actions
             action_dict, action_dict_np = self._decode_action_batch(actions)
-            next_states_np = {
+            next_obs_dict = {
                 k: v.detach().cpu().numpy()
-                for k, v in wm.rollout.step(action_dict).items()
+                for k, v in self.rollout_env.rollout.step(action_dict).items()
             }
-            returns += self._batched_reward(prev_states_np, action_dict_np, next_states_np)
+            returns += self._batched_reward(obs_dict, action_dict_np, next_obs_dict)
 
             if step_idx == horizon - 1:
                 break
             
             # for the next step, sample a new batch of random actions
-            actions = [wm.action_space.sample() for _ in range(self.num_parallel_evals)]
+            idx = np.random.randint(len(self.actions), size=self.num_parallel_evals)
+            actions = [self.actions[i] for i in idx]
 
         return float(returns.mean())
 

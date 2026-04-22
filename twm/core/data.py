@@ -7,7 +7,9 @@ import random
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, List, Tuple
+
+from twm.core.spec import EnvSpec
 
 Tensor = torch.Tensor
 TensorDict = Dict[str, Tensor]
@@ -34,19 +36,36 @@ def dict_append(src: Dict[str, Any], dest: Dict[str, List[Any]]) -> None:
         dest.setdefault(key, []).append(np.asarray(value))
 
 
-def dict_to_array(src: Dict[str, Any]) -> ArrayDict:
+def dict_to_array(src: TensorDict) -> ArrayDict:
     '''Converts a dict of lists into a dict of numpy arrays.'''
     return {k: np.asarray(v) for k, v in src.items()}
 
 
-def dict_to_tensor(src: Dict[str, Any]) -> TensorDict:
+def dict_to_tensor(src: ArrayDict) -> TensorDict:
     '''Converts a dict of numpy arrays into a dict of PyTorch tensors.'''
     return {k: torch.from_numpy(v).float() for k, v in src.items()}
 
 
-def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: str, 
-                       render: bool=False) -> None:
-    '''Collects vector data by running a policy in an environment and saves it to file.'''
+def _create_obs(state, env, env_spec, image_map):
+    obs = {}
+    for key, spec in env_spec.state_spec.items():
+        if spec.prange == 'pixel':
+            obs[key] = image_map(env.render(), spec.shape[1:])
+        else:
+            obs[key] = state[key]
+    return obs
+
+
+def _create_action(action, env_spec):
+    act = {}
+    for key, spec in env_spec.action_spec.items():
+        act[key] = action[key]
+    return act
+
+
+def create_data(env, env_spec: EnvSpec, policy, episodes: int, max_steps: int, 
+                data_name: str, image_map: Callable=image_to_tensor) -> None:
+    '''Collects data by running a policy in an environment and saves it to file.'''
     episodes = int(episodes)
     max_steps = int(max_steps)
 
@@ -54,64 +73,19 @@ def create_vector_data(env, policy, episodes: int, max_steps: int, data_name: st
     
     for _ in (pbar := tqdm(range(episodes), desc='Collecting data')):
         state, _ = env.reset()
-        total_reward = 0.
-
-        for step in range(max_steps):
-            if render:
-                env.render()
-
-            action = policy.sample_action(state)
-            next_state, reward, term, trunc, _ = env.step(action)
-            total_reward += reward
-            done = term or trunc or step == max_steps - 1
-            
-            dict_append(state, states)
-            dict_append(action, actions)
-            dict_append(next_state, next_states)
-            rewards.append(float(reward))
-            dones.append(done)
-            
-            state = next_state
-            if done:
-                break
-        pbar.set_postfix({'Episode Reward': total_reward})
-    
-    # save data
-    data = {
-        'states':      dict_to_array(states),
-        'actions':     dict_to_array(actions),
-        'next_states': dict_to_array(next_states),
-        'rewards':     np.array(rewards),
-        'dones':       np.array(dones),
-    }
-    
-    with open(os.path.join(DATA_PATH, data_name), 'wb') as f:
-        pickle.dump(data, f)
-
-
-def create_image_data(env, policy, episodes: int, max_steps: int, data_name: str, 
-                      image_map: Callable[[Image.Image], Array]=image_to_tensor) -> None:
-    '''Collects image data by running a policy in an environment, and saves it to a file.
-    Uses the environment's render function to get image observations.'''
-    episodes = int(episodes)
-    max_steps = int(max_steps)
-
-    states, actions, next_states, rewards, dones = {}, {}, {}, [], []
-    
-    for _ in (pbar := tqdm(range(episodes), desc='Collecting data')):
-        state, _ = env.reset()
-        obs = {'obs': image_map(env.render())}
+        obs = _create_obs(state, env, env_spec, image_map)
         total_reward = 0.
 
         for step in range(max_steps):
             action = policy.sample_action(state)
+            action_obs = _create_action(action, env_spec)
             next_state, reward, term, trunc, _ = env.step(action)
-            next_obs = {'obs': image_map(env.render())}
+            next_obs = _create_obs(next_state, env, env_spec, image_map)
             total_reward += reward
             done = term or trunc or step == max_steps - 1
-
+            
             dict_append(obs, states)
-            dict_append(action, actions)
+            dict_append(action_obs, actions)
             dict_append(next_obs, next_states)
             rewards.append(float(reward))
             dones.append(done)
@@ -128,8 +102,9 @@ def create_image_data(env, policy, episodes: int, max_steps: int, data_name: str
         'next_states': dict_to_array(next_states),
         'rewards':     np.array(rewards),
         'dones':       np.array(dones),
+        'spec':        env_spec,
     }
-
+    
     with open(os.path.join(DATA_PATH, data_name), 'wb') as f:
         pickle.dump(data, f)
 
@@ -156,6 +131,7 @@ def load_episodic_data(data_name: str) -> Generator[Dict[str, Any], None, None]:
             'rewards':     data['rewards'][start:end],
             'dones':       dones_ep,
             'len':         end - start,
+            'spec':        data['spec'],
         }
 
 
@@ -163,54 +139,33 @@ class SequenceDataset(torch.utils.data.Dataset):
     '''A PyTorch Dataset that takes episodic data and returns padded sequences of a 
     specified length.'''
 
-    def __init__(self, episodes, seq_len: int, obs_states: Optional[Set[str]]=None,
+    def __init__(self, episodes, seq_len: int, 
                  augment_starts: bool=False, min_frames: int=2) -> None:
         self.seq_len = seq_len
-        if obs_states is None:
-            obs_states = set(episodes[0]['states'].keys())
-        self.obs_states = set(obs_states)
         self.augment_starts = augment_starts
         self.min_frames = max(1, int(min_frames))
-        
-        # store raw per-episode arrays and build a flat (ep_idx, t) sample index        
-        _episodes, self._index = SequenceDataset.init_episodes(episodes, self.obs_states)
-        self.state_dims = {k: v.shape[1:] for k, v in _episodes[0]['states'].items()}
-        self.action_dims = {k: v.shape[1:] for k, v in _episodes[0]['actions'].items()}
-        self.input_dims = {**self.state_dims, **self.action_dims}
-        self._episodes = _episodes
-
-        # calculate data set stats for normalization
-        self.normalizer_stats = SequenceDataset.init_stats(_episodes)
+        self.env_spec = episodes[0]['spec']
+              
+        self._episodes, self._index = self.make_episode_index(episodes)
+        self.normalizer_stats = self.init_stats(self._episodes)
 
     # <------------------------------- Data preparation  ------------------------------>
 
     @staticmethod
-    def init_episodes(episodes, obs_states: Set[str]):
-        '''Processes raw episode data, optionally selecting a subset of states, and builds 
-        a flat (ep_idx, t) sample index.'''
-        new_episodes, index = [], []
-
-        for ep_idx, ep in enumerate(episodes):
-
-            # optionally select only a subset of states to be returned by the dataset
-            new_episodes.append({
-                'states':      {k: v for k, v in ep['states'].items() if k in obs_states},
-                'actions':     ep['actions'],
-                'next_states': {k: v for k, v in ep['next_states'].items() if k in obs_states},
-                'rewards':     ep['rewards'],
-                'dones':       ep['dones'],
-                'len':         ep['len'],
-            })
-            
-            # build a flat (ep_idx, t) sample index for the dataset
+    def make_episode_index(episodes):
+        '''Builds a flat (ep_idx, t) sample index to index into the dataset.'''
+        new_episodes = list(episodes)
+        index = []
+        for ep_idx, ep in enumerate(new_episodes):
             for t in range(ep['len']):
                 index.append((ep_idx, t))
-
         return new_episodes, index
 
     @staticmethod
     def init_stats(episodes):
         '''Calculates mean and std for states and actions across the entire dataset.'''
+        env_spec = episodes[0]['spec']
+
         states, actions = {}, {}
         for ep in episodes:
             dict_append(ep['next_states'], states)
@@ -219,17 +174,21 @@ class SequenceDataset(torch.utils.data.Dataset):
         # calculate data set stats for state
         stats = {}
         for key, values in states.items():
-            all_states = torch.from_numpy(np.concatenate(values, axis=0)).float()
-            state_mean = all_states.mean(dim=0)
-            state_std = all_states.std(dim=0).clamp(min=1e-8)
-            stats[key] = (state_mean, state_std)
+            spec = env_spec.state_spec[key]
+            if spec.prange in ('int', 'real'):
+                all_states = torch.from_numpy(np.concatenate(values, axis=0)).float()
+                state_mean = all_states.mean(dim=0).reshape(spec.shape)
+                state_std = all_states.std(dim=0).clamp(min=1e-8).reshape(spec.shape)
+                stats[key] = (state_mean, state_std)
         
         # calculate data set stats for action       
         for key, values in actions.items():
-            all_actions = torch.from_numpy(np.concatenate(values, axis=0)).float()
-            action_mean = all_actions.mean(dim=0)
-            action_std = all_actions.std(dim=0).clamp(min=1e-8)
-            stats[key] = (action_mean, action_std)
+            spec = env_spec.action_spec[key]
+            if spec.prange in ('int', 'real'):
+                all_actions = torch.from_numpy(np.concatenate(values, axis=0)).float()
+                action_mean = all_actions.mean(dim=0).reshape(spec.shape)
+                action_std = all_actions.std(dim=0).clamp(min=1e-8).reshape(spec.shape)
+                stats[key] = (action_mean, action_std)
 
         return stats
 
@@ -247,7 +206,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         return new_x, pad_len
 
     @staticmethod
-    def increase_padding(x: Array, old_pad: int, new_pad: int) -> Array:
+    def increase_pad(x: Array, old_pad: int, new_pad: int) -> Array:
         '''Increases the padding of a sequence tensor from old_pad to new_pad.'''
         seq_len = x.shape[0]
         old_real = seq_len - old_pad
@@ -259,13 +218,13 @@ class SequenceDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> Dict[str, Tensor | TensorDict]:
         '''Returns a padded sequence sample from the dataset at the given index.'''
         ep_idx, t = self._index[idx]
         ep = self._episodes[ep_idx]
         
         # get padded sequences of states, actions, rewards, dones, and next_states
-        states = {k: self.make_padded(v, t, self.seq_len)[0]
+        states = {k: self.make_padded(v, t, self.seq_len)[0] 
                   for k, v in ep['states'].items()}
         actions = {k: self.make_padded(v, t, self.seq_len)[0]
                    for k, v in ep['actions'].items()}            
@@ -279,12 +238,10 @@ class SequenceDataset(torch.utils.data.Dataset):
             max_pad = max(seq_len - self.min_frames, pad)
             new_pad = np.random.randint(pad, max_pad + 1)
             if new_pad > pad:
-                states = {k: SequenceDataset.increase_padding(v, pad, new_pad) 
-                          for k, v in states.items()}
-                actions = {k: SequenceDataset.increase_padding(v, pad, new_pad) 
-                           for k, v in actions.items()}
-                rewards = SequenceDataset.increase_padding(rewards, pad, new_pad)
-                dones = SequenceDataset.increase_padding(dones, pad, new_pad)
+                states = {k: self.increase_pad(v, pad, new_pad) for k, v in states.items()}
+                actions = {k: self.increase_pad(v, pad, new_pad) for k, v in actions.items()}
+                rewards = self.increase_pad(rewards, pad, new_pad)
+                dones = self.increase_pad(dones, pad, new_pad)
                 pad = new_pad
 
         # convert to PyTorch tensors and return
@@ -300,8 +257,7 @@ class SequenceDataset(torch.utils.data.Dataset):
 
 def get_dataloader(data_name: str, seq_len: int, batch_size: int=64, test_split: float=0.1, 
                    seed: int=0, **dataset_kwargs):
-    '''Loads episodic data from a file, splits into train/test sets, and returns PyTorch 
-    DataLoaders for each.'''
+    '''Loads episodic data from a file, splits into train/test sets.'''
     # load episodic data
     episodes = list(load_episodic_data(data_name))
     n_episodes = len(episodes)

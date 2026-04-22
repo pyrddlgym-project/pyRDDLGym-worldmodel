@@ -6,108 +6,80 @@ from typing import Dict, Tuple
 Tensor = torch.Tensor
 TensorDict = Dict[str, Tensor]
 Shape = Tuple[int, ...]
-ShapeDict = Dict[str, Shape]
 
 
 # <------------------------------- Vector In and Out  ------------------------------>
 
 class VectorEncoder(nn.Module):
-    '''An MLP to encode vector states and actions into a (d_model,) embedding for the 
-    transformer.'''
+    '''An MLP to encode vector states and actions into a (d_model,) embedding.'''
 
-    def __init__(self, input_dims: ShapeDict, d_model: int) -> None:
+    def __init__(self, input_shape: Shape, d_model: int) -> None:
         super().__init__()
 
-        # total input dimension is the sum of all state and action dimensions
-        in_dim = sum(int(np.prod(shape, dtype=np.int64)) for shape in input_dims.values())
-
         # simple MLP to project state and action vector into (d_model,) embedding
+        in_dim = int(np.prod(input_shape, dtype=np.int64))
         n_hidden = (in_dim + d_model) // 2
-        self.input_proj = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(in_dim, n_hidden),
             nn.GELU(),
             nn.Linear(n_hidden, d_model)
         )
 
-    def forward(self, input_dict: TensorDict) -> Tensor:
-
-        # concatenate all state and action tensors into a single vector
-        batch, seq_len = next(iter(input_dict.values())).shape[:2]
-        x = [v.view(batch, seq_len, -1) for v in input_dict.values()]
-        x = torch.cat(x, dim=-1)
+    def forward(self, x: Tensor) -> Tensor:
+        batch, seq_len = x.shape[:2]
         x = x.view(batch * seq_len, -1)
-
-        # project concatenated vector into (d_model,) embedding
-        x_emb = self.input_proj(x)
-        x_emb = x_emb.view(batch, seq_len, -1)
-        return x_emb
+        enc = self.encoder(x)
+        enc = enc.view(batch, seq_len, -1)
+        return enc
 
 
 class VectorDecoder(nn.Module):
-    '''An MLP to decode a (d_model,) embedding into vector states for the transformer.'''
-
+    '''An MLP to decode a (d_model,) embedding into vector states.'''
     condition_mode = 'last'
 
-    def __init__(self, state_dims: ShapeDict, d_model: int) -> None:
+    def __init__(self, output_shape: Shape, d_model: int) -> None:
         super().__init__()
-
-        # total output dimension is the sum of all state dimensions
-        self.state_dims = state_dims
-        s_dim = sum(int(np.prod(shape, dtype=np.int64)) for shape in state_dims.values())
-
+        self.output_shape = output_shape
+        
         # simple MLP to project (d_model,) embedding back into state dict
-        n_hidden = (d_model + s_dim) // 2
-        self.output_proj = nn.Sequential(
+        out_dim = int(np.prod(output_shape, dtype=np.int64))
+        n_hidden = (d_model + out_dim) // 2
+        self.decoder = nn.Sequential(
             nn.Linear(d_model, n_hidden),
             nn.GELU(),
-            nn.Linear(n_hidden, s_dim),
+            nn.Linear(n_hidden, out_dim),
         )
     
-    def forward(self, x: Tensor) -> TensorDict:
+    def forward(self, x: Tensor) -> Tensor:
         assert x.dim() == 2, 'Decoder input should be (batch, d_model).'
-        next_state = self.output_proj(x)
-
-        # split output vector back into state dict
-        output_dict = {}
-        idx = 0
-        for key, shape in self.state_dims.items():
-            dim = int(np.prod(shape, dtype=np.int64))
-            output_dict[key] = next_state[:, idx:idx+dim].view(x.size(0), *shape)
-            idx += dim
-        return output_dict
+        dec = self.decoder(x)
+        dec = dec.view(-1, *self.output_shape)
+        return dec
 
 
 # <------------------------------- Image In and Out  ------------------------------>
 
 class ImageEncoder(nn.Module):
-    '''A CNN to encode images into a (d_model,) embedding for the transformer.'''
+    '''A CNN to encode images into a (d_model,) embedding.'''
 
-    def __init__(self, input_dims: ShapeDict, d_model: int, 
+    def __init__(self, image_shape: Shape, d_model: int, 
                  sizes: Tuple[int, ...]=(32, 64, 128)) -> None:
         super().__init__()
 
         if len(sizes) == 0:
-            raise ValueError('ImageEncoder sizes must not be empty.')
-
-        # for visual inputs, we expect a single key 'obs' in input_dims of shape (C, H, W)
-        # we use a CNN to project this image input into the (d_model,) embedding space
-        input_dims = dict(input_dims)
-        if 'obs' not in input_dims:
-            raise ValueError('For visual inputs, input_dims should have key "obs".')
-        obs_shape = input_dims.pop('obs')
-        if len(obs_shape) != 3:
-            raise ValueError('For visual inputs, input_dims["obs"] should be (C, H, W).')
-        n_channels = obs_shape[0]
-
+            raise ValueError('sizes must not be empty.')
+        if len(image_shape) != 3:
+            raise ValueError('Image_shape should be (C, H, W).')
+        
         # create conv layers
         conv_layers = []
-        in_ch = n_channels
+        in_ch = image_shape[0]
         for out_ch in sizes:
             conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1))
             conv_layers.append(nn.GELU())
             in_ch = out_ch
 
-        self.state_proj = nn.Sequential(
+        self.encoder = nn.Sequential(
             *conv_layers,
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
@@ -115,42 +87,32 @@ class ImageEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
-
-        # actions projected with an MLP and concatenated to the projected image embedding
-        self.action_proj = VectorEncoder(input_dims, d_model)
     
-    def forward(self, input_dict: TensorDict) -> Tensor:
-
-        # project state through CNN
-        input_dict = dict(input_dict)
-        img = input_dict.pop('obs')
-        batch, seq_len, c, h, w = img.shape
-        img = img.view(batch * seq_len, c, h, w)
-        state_emb = self.state_proj(img).view(batch, seq_len, -1)
-
-        # project action through MLP
-        action_emb = self.action_proj(input_dict)   # (batch, seq_len, d_model)
-
-        # combine state and action projections in embedding space
-        return state_emb + action_emb
+    def forward(self, x: Tensor) -> Tensor:
+        batch, seq_len, c, h, w = x.shape
+        x = x.view(batch * seq_len, c, h, w)
+        enc = self.encoder(x)
+        enc = enc.view(batch, seq_len, -1)
+        return enc
 
 
 class ImageDecoder(nn.Module):
-    '''A CNN to decode a (d_model,) embedding into images for the transformer output.'''
-
+    '''A CNN to decode a (d_model,) embedding into images.'''
     condition_mode = 'last'
 
-    def __init__(self, image_dims: Tuple[int, int, int], d_model: int,
-                 sizes: Tuple[int, ...]=(256, 128, 64, 32), min_value: float=1e-6) -> None:
+    def __init__(self, image_shape: Shape, d_model: int,
+                 sizes: Tuple[int, ...]=(256, 128, 64, 32), 
+                 min_value: float=1e-6) -> None:
         super().__init__()
         self.min_value = min_value
 
         if len(sizes) == 0:
-            raise ValueError('ImageDecoder sizes must not be empty.')
+            raise ValueError('sizes must not be empty.')
+        if len(image_shape) != 3:
+            raise ValueError('Image_shape should be (C, H, W).')
         
-        c, h, w = image_dims
-
         # create conv layers
+        c, h, w = image_shape
         conv_layers = []
         in_ch = sizes[0]
         for out_ch in sizes[1:-1]:
@@ -164,7 +126,7 @@ class ImageDecoder(nn.Module):
         conv_layers.append(nn.Upsample(size=(h, w), mode='bilinear', align_corners=False))
         conv_layers.append(nn.Conv2d(out_ch, c, kernel_size=3, stride=1, padding=1))
 
-        self.output_proj = nn.Sequential(
+        self.decoder = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
             nn.Linear(d_model * 4, sizes[0] * 4 * 4),
@@ -174,9 +136,9 @@ class ImageDecoder(nn.Module):
             nn.Sigmoid(),
         )
     
-    def forward(self, x: Tensor) -> TensorDict:
+    def forward(self, x: Tensor) -> Tensor:
         assert x.dim() == 2, 'Decoder input should be (batch, d_model).'
-        img = self.output_proj(x)
-        img = img.clamp(self.min_value, 1.0 - self.min_value)
-        next_state = {'obs': img}
-        return next_state
+        dec = self.decoder(x)
+        dec = dec.clamp(self.min_value, 1.0 - self.min_value)
+        return dec
+    

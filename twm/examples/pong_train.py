@@ -3,9 +3,21 @@ import torch
 import pyRDDLGym
 from pyRDDLGym.core.policy import BaseAgent
 
-from twm.core.data import create_vector_data, get_dataloader, \
+from twm.core.data import create_data, get_dataloader, \
     plot_data_trajectories, plot_trajectories, save_video
 from twm.core.model import WorldModel, WorldModelEvaluator
+from twm.core.spec import EnvSpec, FluentSpec
+
+
+state_spec = {
+    'ball-x': FluentSpec(shape=(1,), prange='real'),
+    'ball-y': FluentSpec(shape=(1,), prange='real'),
+    'paddle-y': FluentSpec(shape=(1,), prange='real'),
+}
+action_spec = {
+    'move': FluentSpec(shape=(), prange='int', values=[-1, 0, 1]),
+}
+env_spec = EnvSpec(state_spec=state_spec, action_spec=action_spec)
 
 
 class PongEnvWithRandomStarts:
@@ -61,21 +73,24 @@ def vec_policy(states):
 def create_pong_data(episodes=500, max_steps=200, save_path='pong_data.pkl'):
     env = PongEnvWithRandomStarts()
     policy = PongPolicy()
-    create_vector_data(env, policy, episodes, max_steps, save_path)
+    create_data(env, env_spec, policy, episodes, max_steps, save_path)
 
 
 def plot_rollouts(model, batch_size=4):
     env = PongEnvWithRandomStarts()
 
-    rollout_context = WorldModelEvaluator(model)
+    # rollout trajectories from the world model
+    eval = WorldModelEvaluator(model)
     init_states = {k: torch.from_numpy(v).float().to('cuda')[None, None]
                    for k, v in env.reset()[0].items()}
-    trajectories = rollout_context.rollout(init_states, None, vec_policy, max_steps=200)
+    trajectories = eval.rollout(init_states, None, vec_policy, max_steps=200)
     trajectories = [{k: v[0].detach().cpu() for k, v in trajectories.items()}]
     
+    # plot rollouts
     plot_data_trajectories('pong_data.pkl', batch_size, 'pong_data_rollouts.png')
     plot_trajectories(trajectories, 'pong_model_rollouts.png')
 
+    # save rollout video
     def render_fn(state_dict):
         state = {'ball-x___b1': state_dict['ball-x'][0].item(),
                  'ball-y___b1': state_dict['ball-y'][0].item(), 
@@ -88,17 +103,13 @@ if __name__ == "__main__":
     # create_pong_data()
     seq_len = 8
     fit = False
-
+    
     if fit:
         train_loader, test_loader = get_dataloader(
-            'pong_data.pkl', seq_len, batch_size=64, 
-            obs_states=['ball-x', 'ball-y', 'paddle-y'], augment_starts=False
-        )
-        state_dims = train_loader.dataset.state_dims
-        action_dims = train_loader.dataset.action_dims
+            'pong_data.pkl', seq_len, batch_size=64, augment_starts=False)
    
-        model = WorldModel(state_dims, action_dims, visual=False, seq_len=seq_len).to('cuda')
-        model.fit(train_loader, lr=0.001, epochs=1000, test_data_loader=test_loader, 
+        model = WorldModel(env_spec=env_spec, seq_len=seq_len).to('cuda')
+        model.fit(train_loader, lr=0.001, epochs=3, test_data_loader=test_loader, 
                   model_name=f'pong_world_model_{seq_len}.pth')
     
     else:

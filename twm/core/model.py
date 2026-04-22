@@ -3,15 +3,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 from twm.core.encoding import SinePositionalEncoding, RotaryTransformerEncoderLayer
 from twm.core.projection import (
-    VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder, 
-    Tensor, TensorDict, ShapeDict
+    VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder, Tensor, TensorDict
 )
+from twm.core.spec import EnvSpec
 
 Array = np.ndarray
+ArrayDict = Dict[str, Array]
 
 PARENT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 MODEL_PATH = os.path.join(PARENT_PATH, 'models')
@@ -41,16 +42,14 @@ class WorldModel(nn.Module):
     '''A transformer-based world model that predicts the next state given a sequence of 
     past states and actions.'''
 
-    def __init__(self, state_dims: ShapeDict, action_dims: ShapeDict, visual: bool, 
-                 seq_len: int, d_model: int=64, 
-                 nhead: int=4, num_layers: int=4, dim_feedforward: int=256, 
-                 dropout: float=0.1, norm_first: bool=True, 
+    def __init__(self, env_spec: EnvSpec,  
+                 seq_len: int, d_model: int=64, nhead: int=4, num_layers: int=4, 
+                 dim_feedforward: int=256, dropout: float=0.1, norm_first: bool=True, 
                  use_absolute_pe: bool=True, use_rope: bool=True) -> None:
         super().__init__()
 
-        self.state_dims = state_dims
-        self.action_dims = action_dims
-        self.visual = visual
+        self.env_spec = env_spec
+        self.input_specs = {**env_spec.state_spec, **env_spec.action_spec}
         self.seq_len = seq_len
         self.d_model = d_model
         self.nhead = nhead
@@ -60,20 +59,25 @@ class WorldModel(nn.Module):
         self.norm_first = norm_first
         self.use_absolute_pe = use_absolute_pe
         self.use_rope = use_rope
-
+        
         # (state, action) -> (d_model,) embedding -> next state prediction
-        self.input_dims = {**state_dims, **action_dims}    
-        if self.visual:
-            assert len(state_dims) == 1, 'For visual, state_dims must have one key.'
-            assert 'obs' in state_dims, 'For visual, state_dims must have key \'obs\'.'
-            c, h, w = state_dims['obs']
-            self.input_proj = ImageEncoder(self.input_dims, d_model)
-            self.output_proj = ImageDecoder((c, h, w), d_model)
-            self.loss_fn = nn.BCELoss()
-        else:
-            self.input_proj = VectorEncoder(self.input_dims, d_model)
-            self.output_proj = VectorDecoder(state_dims, d_model)
-            self.loss_fn = nn.HuberLoss()
+        self.encoders = nn.ModuleDict()
+        self.decoders = nn.ModuleDict()
+        self.loss_fns = nn.ModuleDict()
+        for key, spec in self.input_specs.items():
+            if spec.prange == 'pixel':
+                self.encoders[key] = ImageEncoder(spec.shape, d_model)
+                if key in env_spec.state_spec:
+                    self.decoders[key] = ImageDecoder(spec.shape, d_model)
+                    self.loss_fns[key] = nn.BCELoss()
+            else:
+                self.encoders[key] = VectorEncoder(spec.shape, d_model)
+                if key in env_spec.state_spec:
+                    self.decoders[key] = VectorDecoder(spec.shape, d_model)
+                    self.loss_fns[key] = nn.HuberLoss()
+        
+        # combine encoder embeddings into a single latent
+        self.input_proj = nn.Linear(len(self.encoders) * d_model, d_model)
         
         # Keep input feature scaling stable regardless of transformer norm mode
         self.input_norm = nn.LayerNorm(d_model)
@@ -116,9 +120,10 @@ class WorldModel(nn.Module):
         self.output_norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
         
         # placeholder normalizer buffers
-        for key, shape in self.input_dims.items():
-            self.register_buffer(f'{key}_mean', torch.zeros(shape))
-            self.register_buffer(f'{key}_std', torch.ones(shape))
+        for key, spec in self.input_specs.items():
+            self.register_buffer(f'{key}_mean', torch.zeros(spec.shape))
+            self.register_buffer(f'{key}_std', torch.ones(spec.shape))
+            self.register_buffer(f'{key}_norm', torch.tensor(True, dtype=torch.bool))
             
     @property
     def device(self) -> torch.device:
@@ -129,42 +134,47 @@ class WorldModel(nn.Module):
 
     def set_dataset_stats(self, dataset) -> None:
         '''Sets the normalization statistics for states and actions for the dataset.'''
-        for key, (mean, std) in dataset.normalizer_stats.items():
-            self.register_buffer(f'{key}_mean', mean.to(self.device))
-            self.register_buffer(f'{key}_std', std.to(self.device))
+        for key in self.input_specs:
+            if key in dataset.normalizer_stats:
+                mean, std = dataset.normalizer_stats[key]
+                self.register_buffer(f'{key}_mean', mean.to(self.device))
+                self.register_buffer(f'{key}_std', std.to(self.device))
+                self.register_buffer(f'{key}_norm', torch.tensor(True, dtype=torch.bool))
+            else:
+                self.register_buffer(f'{key}_norm', torch.tensor(False, dtype=torch.bool))
         
     def normalize_inputs(self, inputs: TensorDict) -> TensorDict:
         '''Normalizes inputs using the dataset statistics.'''
         result = {}
         for key, tensor in inputs.items():
-            if self.visual and key in self.state_dims:
-                result[key] = tensor
-            else:
+            if getattr(self, f'{key}_norm').item():
                 mean = getattr(self, f'{key}_mean')
                 std = getattr(self, f'{key}_std')
                 mean = mean.view(*(1,) * (tensor.ndim - mean.ndim), *mean.shape)
                 std = std.view(*(1,) * (tensor.ndim - std.ndim), *std.shape)
                 result[key] = (tensor - mean) / std
+            else:
+                result[key] = tensor
         return result
         
     def unnormalize_inputs(self, inputs: TensorDict) -> TensorDict:
         '''Unnormalizes inputs using the dataset statistics.'''
         result = {}
         for key, tensor in inputs.items():
-            if self.visual and key in self.state_dims:
-                result[key] = tensor
-            else:
+            if getattr(self, f'{key}_norm').item():
                 mean = getattr(self, f'{key}_mean')
                 std = getattr(self, f'{key}_std')
                 mean = mean.view(*(1,) * (tensor.ndim - mean.ndim), *mean.shape)
                 std = std.view(*(1,) * (tensor.ndim - std.ndim), *std.shape)
                 result[key] = tensor * std + mean
+            else:
+                result[key] = tensor
         return result
     
     @torch.no_grad()
     def pad_with_zeros(self, x: Tensor) -> Tensor:
         '''Pads a sequence to the required context length.'''
-        x = x.to(self.device).clone()
+        x = x.clone()
         batch, x_len, *shape = x.shape
         if x_len >= self.seq_len:
             return x[:, -self.seq_len:]
@@ -187,7 +197,8 @@ class WorldModel(nn.Module):
         device = self.device
 
         # create causal mask
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=device)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_len, device=device)
 
         # add padding mask to causal mask
         pad_mask_ = self.make_padding_mask(pad_lens, seq_len)   # (batch, seq_len)
@@ -204,17 +215,29 @@ class WorldModel(nn.Module):
 
     # <---------------------------------- transformer ---------------------------------->
 
+    def embed_inputs(self, states: TensorDict, actions: TensorDict) -> Tensor:
+        '''Projects states and actions into the transformer input space.'''
+        # filter and normalize inputs
+        states = {k: v for k, v in states.items() if k in self.env_spec.state_spec}
+        actions = {k: v for k, v in actions.items() if k in self.env_spec.action_spec}
+        states = self.normalize_inputs(states)
+        actions = self.normalize_inputs(actions)
+        
+        # embed each state and action separately
+        state_enc = [self.encoders[k](v) for k, v in states.items()]
+        action_enc = [self.encoders[k](v) for k, v in actions.items()]
+
+        # concatenate all embeddings and project to the embedding space
+        x = torch.cat(state_enc + action_enc, dim=-1)  # (batch, seq_len, n_input * d_model)
+        x = self.input_proj(x)   # (batch, seq_len, d_model)
+        return x
+    
     def encode_history(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor
                        ) -> Tensor:
         '''Encodes a history of states and actions into latents using the transformer.'''
-        # prepare states and actions and map to latent dimension space
-        states = {k: v for k, v in states.items() if k in self.state_dims}
-        states = self.normalize_inputs(states)
-        actions = self.normalize_inputs(actions)
-        x = {**states, **actions}
-        x = self.input_proj(x)   # (batch, seq_len, d_model)
-        x = self.input_norm(x)
-        x = x.clone()
+        # combine all state and action embeddings into a single sequence of latents
+        x = self.embed_inputs(states, actions)   # (batch, seq_len, d_model)
+        x = self.input_norm(x).clone()
 
         # replace padded positions with learnable PAD embedding
         batch, seq_len = x.shape[:2]
@@ -234,54 +257,65 @@ class WorldModel(nn.Module):
         latents = self.output_norm(latents)
         return latents
 
-    def select_condition(self, latents: Tensor, pad_lens: Tensor) -> Tensor:
+    def select_condition(self, latents: Tensor, pad_lens: Tensor) -> TensorDict:
         '''Selects the appropriate latent from the transformer to feed to the decoder.'''
-        # if using sequence-level conditioning, return the full sequence of latents
-        if self.output_proj.condition_mode == 'sequence':
-            return latents
-            
-        # otherwise, select the latents corresponding to the last real tokens
+        # select the latents corresponding to the last real tokens
         batch, seq_len = latents.shape[:2]
         last_real_idx = (seq_len - pad_lens - 1).clamp(min=0)
         batch_idx = torch.arange(batch, device=self.device)
         last_latent = latents[batch_idx, last_real_idx]
-        return last_latent
+
+        # choose latents depending on the decoder's conditioning mode
+        result_latents = {}
+        for key, decoder in self.decoders.items():
+            if decoder.condition_mode == 'last':
+                result_latents[key] = last_latent
+            elif decoder.condition_mode == 'sequence':
+                result_latents[key] = latents
+            else:
+                raise ValueError(f'Invalid condition mode: {decoder.condition_mode}')
+        return result_latents
 
     def forward(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor,
-                return_latent: bool=False, unnormalize: bool=False
-                ) -> Union[Tensor, TensorDict]:
+                return_latent: bool=False, unnormalize: bool=False) -> TensorDict:
         '''Predicts the next state or latent given a history of states and actions.'''
+        # encode the history of states and actions into latents
         latents = self.encode_history(states, actions, pad_lens)
         latents = self.select_condition(latents, pad_lens)
         if return_latent:
             return latents
         
-        next_states = self.output_proj(latents)
+        # decode the latents into next state predictions for each observed key
+        next_states = {}
+        for key, decoder in self.decoders.items():
+            if key not in self.env_spec.state_spec:
+                raise ValueError(f'Decoder key not in state spec: {key}')
+            next_states[key] = decoder(latents[key])
         if unnormalize:
             next_states = self.unnormalize_inputs(next_states)
         return next_states
     
     # <---------------------------- training and evaluation ----------------------------->
 
+    def to_device(self, values: TensorDict) -> TensorDict:
+        '''Moves a dictionary of tensors to the same device and dtype as the model.'''
+        return {k: v.to(self.device) for k, v in values.items()}
+    
     def loss(self, states: TensorDict, actions: TensorDict, next_states: TensorDict, 
              pad_lens: Tensor) -> Tensor:
         '''Computes the loss between predicted and true next states.'''
-        device = self.device
-        states = {k: v.to(device) for k, v in states.items()}
-        actions = {k: v.to(device) for k, v in actions.items()}
-        next_states = {k: v.to(device) for k, v in next_states.items()}
-        pad_lens = pad_lens.to(device)
-        
-        # normalize inputs as targets and get predictions
-        targets = {k: v for k, v in next_states.items() if k in self.state_dims}
+        # normalize inputs as targets
+        targets = {k: v for k, v in next_states.items() if k in self.env_spec.state_spec}
         targets = self.normalize_inputs(targets)
+
+        # predict next states from the model
         preds = self.forward(states, actions, pad_lens, unnormalize=False)
         assert isinstance(preds, dict), 'Model output must be a dict.'
 
         # compute loss across all state keys and sum
-        loss = torch.tensor(0., device=device)
+        loss = torch.tensor(0., device=self.device)
         for key in targets.keys():
-            loss += self.loss_fn(preds[key], targets[key])
+            loss += self.loss_fns[key](preds[key], targets[key])
         return loss
     
     @torch.no_grad()
@@ -294,10 +328,10 @@ class WorldModel(nn.Module):
 
         loss = 0.
         for batch_data in tqdm(data_loader, desc='Evaluating'):
-            states = batch_data['states']
-            actions = batch_data['actions']
-            next_states = batch_data['next_states']
-            pad_lens = batch_data['pad']
+            states = self.to_device(batch_data['states'])
+            actions = self.to_device(batch_data['actions'])
+            next_states = self.to_device(batch_data['next_states'])
+            pad_lens = batch_data['pad'].to(self.device)
             loss += self.loss(states, actions, next_states, pad_lens).item()
         return loss / len(data_loader)
 
@@ -321,10 +355,10 @@ class WorldModel(nn.Module):
             # training loop
             epoch_loss = 0.
             for batch_data in tqdm(train_data_loader, desc=f'Epoch {epoch+1}/{epochs}'):
-                states = batch_data['states']
-                actions = batch_data['actions']
-                next_states = batch_data['next_states']
-                pad_lens = batch_data['pad']
+                states = self.to_device(batch_data['states'])
+                actions = self.to_device(batch_data['actions'])
+                next_states = self.to_device(batch_data['next_states'])
+                pad_lens = batch_data['pad'].to(self.device)
                 loss = self.loss(states, actions, next_states, pad_lens)
 
                 optim.zero_grad()
@@ -354,9 +388,7 @@ class WorldModel(nn.Module):
     def _config(self) -> Dict[str, Any]:
         '''Returns a dictionary of the model configuration parameters for saving.'''
         return {
-            'state_dims': self.state_dims,
-            'action_dims': self.action_dims,
-            'visual': self.visual,
+            'env_spec': self.env_spec.serialize(),
             'seq_len': self.seq_len,
             'd_model': self.d_model,
             'nhead': self.nhead,
@@ -379,8 +411,10 @@ class WorldModel(nn.Module):
     @classmethod
     def load(cls, model_name: str, device: str='cuda') -> 'WorldModel':
         '''Loads a model from a file, reconstructing the architecture from the config.'''
-        checkpoint = torch.load(os.path.join(MODEL_PATH, model_name), map_location=device)
+        checkpoint = torch.load(
+            os.path.join(MODEL_PATH, model_name), map_location=device, weights_only=False)
         config = checkpoint['config']
+        config['env_spec'] = EnvSpec.deserialize(config['env_spec'])
         state_dict = checkpoint['state_dict']
         
         model = cls(**config)
@@ -401,15 +435,13 @@ class WorldModelEvaluator:
         '''Resets the rollout context with initial states and actions.'''
         device = self.device
 
-        # ensure batch dimension is present and get batch size and initial sequence length
+        # ensure batch dimension and get batch size and initial sequence length
         batch, init_len = next(iter(init_states.values())).shape[:2]
         assert init_len >= 1, 'reset requires at least one initial timestep.'
 
         # extract only the observed states, pad to required length and store in buffer
         self.states = {}
-        for key in self.model.state_dims:   
-            if key not in init_states:
-                raise ValueError(f'Missing initial state for observed key: {key}')
+        for key in self.model.env_spec.state_spec:  
             tensor = init_states[key].to(device)
             self.states[key] = self.model.pad_with_zeros(tensor)
 
@@ -417,14 +449,12 @@ class WorldModelEvaluator:
         if init_actions is None:
             assert init_len == 1, 'Must pass single initial state.'
             self.actions = {
-                k: torch.zeros(batch, self.model.seq_len, *shape, device=device)
-                for k, shape in self.model.action_dims.items()
+                k: torch.zeros(batch, self.model.seq_len, *spec.shape, device=device)
+                for k, spec in self.model.env_spec.action_spec.items()
             }
         else:
             self.actions = {}
-            for key in self.model.action_dims:
-                if key not in init_actions:
-                    raise ValueError(f'Missing initial action for key: {key}')
+            for key in self.model.env_spec.action_spec:
                 tensor = init_actions[key].to(device)
                 self.actions[key] = self.model.pad_with_zeros(tensor)
                 
@@ -439,7 +469,7 @@ class WorldModelEvaluator:
         batch_idx = torch.arange(batch, device=self.device)
         return batch_idx, last_real_idx
 
-    def last_states(self, to_numpy: bool=False) -> Dict[str, Union[Tensor, Array]]:
+    def last_states(self, to_numpy: bool=False) -> ArrayDict | TensorDict:
         '''Extracts the last real states from the rollout context.'''
         batch_idx, last_real_idx = self.index_into_last_epoch()
         result = {}
@@ -459,8 +489,6 @@ class WorldModelEvaluator:
         # set actions at the last real token position for each batch item
         batch_idx, last_real_idx = self.index_into_last_epoch()
         for key, tensor in self.actions.items():
-            if key not in actions:
-                raise ValueError(f'Missing action for key: {key}')
             tensor[batch_idx, last_real_idx] = actions[key]
 
         # predict next state using the model
@@ -473,16 +501,12 @@ class WorldModelEvaluator:
         if torch.any(has_pad):
             append_idx = last_real_idx[has_pad] + 1
             for key, tensor in self.states.items():
-                if key not in next_states:
-                    raise ValueError(f'Model output missing state key: {key}')
                 tensor[has_pad, append_idx] = next_states[key][has_pad]
         
         # for indices without padding, shift left and append at the end
         if torch.any(~has_pad):
             for key, tensor in self.states.items():
                 tensor[~has_pad] = torch.roll(tensor[~has_pad], -1, dims=1)
-                if key not in next_states:
-                    raise ValueError(f'Model output missing state key: {key}')
                 tensor[~has_pad, -1] = next_states[key][~has_pad]
             for key, tensor in self.actions.items():
                 tensor[~has_pad] = torch.roll(tensor[~has_pad], -1, dims=1)
