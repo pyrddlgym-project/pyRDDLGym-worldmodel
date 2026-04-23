@@ -43,8 +43,6 @@ class WorldModelEnv(gym.Env):
         self.set_initial_state(initial_state)
         self.rollout = WorldModelEvaluator(world_model)
 
-    # <--------------------------------- build spaces --------------------------------->
-
     @staticmethod
     def build_space_from_spec(spec: FluentSpec) -> spaces.Space:
         '''Builds a gym space from a FluentSpec.'''
@@ -53,103 +51,60 @@ class WorldModelEnv(gym.Env):
             return spaces.Box(low=0.0, high=1.0, shape=spec.shape, dtype=np.float32)
 
         # real variables use the ranges provided in spec
-        if spec.prange == 'real':
+        elif spec.prange == 'real':
             low, high = (-np.inf, np.inf) if spec.values is None else spec.values
             return spaces.Box(low=low, high=high, shape=spec.shape, dtype=np.float32)
 
         # integer variables must have specified values
-        if spec.prange == 'int':
-            if spec.values is None:
-                raise ValueError('Integer variable must have specified values.')
-            n = len(spec.values)
-            if n < 1:
-                raise ValueError('Integer variable must provide at least one value.')
+        elif spec.prange == 'int':
+            if spec.values is None or len(spec.values) != 2:
+                raise ValueError('Integer variable must have low and high values.')
+            low, high = int(spec.values[0]), int(spec.values[1])
+            n = high - low + 1
             if spec.size == 1:
-                return spaces.Discrete(n)
+                return spaces.Discrete(n, start=low)
             else:
-                return spaces.MultiDiscrete(np.full(spec.shape, n, dtype=np.int64))
+                return spaces.MultiDiscrete(
+                    np.full(spec.shape, n, dtype=np.int64), 
+                    start=np.full(spec.shape, low, dtype=np.int64)
+                )
 
         # boolean variables are represented as Discrete(2) or MultiBinary
-        if spec.prange == 'bool':
+        elif spec.prange == 'bool':
             if spec.size == 1:
                 return spaces.Discrete(2)
             else:
                 return spaces.MultiBinary(spec.shape)
 
-        raise ValueError(f'Unknown prange: {spec.prange}')
+        else:
+            raise ValueError(f'Unknown prange {spec.prange}.')
         
     def set_initial_state(self, initial_state: ArrayDict | TensorDict) -> None:
         '''Sets the initial state of the environment.'''
         result = {}
         for key in self.world_model.env_spec.state_spec:
-            value = initial_state[key]
-            if isinstance(value, np.ndarray):
-                value = torch.from_numpy(value).float()
-            result[key] = value.to(self.device)[None, None]   # (1, 1, state_dims...)
+            value = torch.as_tensor(initial_state[key]).float().to(self.device) 
+            result[key] = value[None, None]   # (1, 1, state_dims...)
         self.initial_state = result
         self.initial_action = None
-    
+
     # <----------------------------------- sampling ----------------------------------->
     
     def reset(self, *, seed: Optional[int]=None, options: Optional[Dict]=None) -> Tuple:
         '''Resets the environment with a new initial state.'''
         super().reset(seed=seed)
         self.rollout.reset(self.initial_state, self.initial_action)
-        self.obs = {k: v[0] for k, v in self.rollout.last_states(to_numpy=True).items()}
+        self.obs = self.rollout.last_states(to_numpy=False, squash=True)
         self.step_num = 0
         return self.obs, {}
 
-    def decode_action(self, action: ArrayDict) -> ArrayDict:
-        '''Maps a gym action dict to the action values expected by the world model.'''
-        decoded = {}
-        for key, spec in self.world_model.env_spec.action_spec.items():
-
-            # decode the raw action value from the dict and ensure shape
-            raw = np.asarray(action[key])
-            if raw.shape == () and spec.size == 1:
-                raw = raw.reshape(spec.shape)
-            if raw.shape != spec.shape:
-                raise ValueError(f'Action {key} has shape {raw.shape} != {spec.shape}.')
-
-            # decode int action according to prange
-            if spec.prange == 'int':
-                values = np.asarray(spec.values)
-                idx = raw.astype(np.int64)
-                if np.any((idx < 0) | (idx >= len(values))):
-                    raise ValueError(f'Action {key} index out of range.')
-                decoded[key] = values[idx].astype(np.float32)
-            
-            # decode bool action
-            elif spec.prange == 'bool':
-                arr = raw.astype(np.float32)
-                if np.any((arr != 0.0) & (arr != 1.0)):
-                    raise ValueError(f'Boolean action {key} must contain only 0/1.')
-                decoded[key] = arr
-            
-            # decode real or pixel action (assumed to already be in correct range)
-            elif spec.prange in ('real', 'pixel'):
-                decoded[key] = raw.astype(np.float32)
-            
-            else:
-                raise ValueError(f'Unknown prange for action {key}: {spec.prange}')
-
-        return decoded
-
     def step(self, action: ArrayDict) -> Tuple:
         '''Performs one step in the environment.'''
-        # decode the action dict to get the raw action values
-        action_np = self.decode_action(action)
-        action_tensor = {
-            k: torch.from_numpy(v).float().to(self.device)[None]
-            for k, v in action_np.items()
-        }
-        
-        # use rollout context to predict next state
-        next_obs = {
-            k: v[0].detach().cpu().numpy() 
-            for k, v in self.rollout.step(action_tensor).items()
-        }
-        reward = self.reward_fn(self.obs, action_np, next_obs)
+        action_torch = {k: torch.as_tensor(v).to(self.device) for k, v in action.items()}
+        action_batched = {k: v[None] for k, v in action_torch.items()}
+        self.rollout.step(action_batched)
+        next_obs = self.rollout.last_states(to_numpy=False, squash=True)
+        reward = self.reward_fn(self.obs, action_torch, next_obs)
         self.obs = next_obs
         self.step_num += 1
         trunc = self.step_num >= self.max_steps
@@ -177,16 +132,15 @@ class DiscreteActionWrapper(gym.ActionWrapper):
         for key, spec in env.world_model.env_spec.action_spec.items():
             
             # determine the number of discrete choices for this action key
-            if spec.prange == 'int':
-                if spec.values is None:
-                    raise ValueError(f'Int action {key} must define values.')
-                n = len(spec.values)
-
-            # boolean actions have 2 choices (0 or 1)
-            elif spec.prange == 'bool':
-                n = 2
-            
-            # real and pixel actions are not discrete and cannot be enumerated
+            if spec.prange in ('int', 'bool'):
+                values = spec.values
+                if spec.prange == 'bool':
+                    values = (0, 1)
+                if values is None or len(values) != 2:
+                    raise ValueError(f'Int action {key} must have values.')
+                low, high = int(values[0]), int(values[1])
+                n = high - low + 1
+                choice = np.arange(low, high + 1, dtype=np.int64)
             else:
                 raise ValueError(
                     f'Only supports discrete actions, got {key} of range {spec.prange}.')
@@ -194,9 +148,9 @@ class DiscreteActionWrapper(gym.ActionWrapper):
             # generate the discrete choices for this action key
             size, shape = spec.size, spec.shape
             if size == 1:
-                choices = [np.asarray(i).reshape(shape) for i in range(n)]
+                choices = [np.full(shape, i) for i in choice]
             else:
-                flat_grids = np.meshgrid(*[np.arange(n)] * size, indexing='ij')
+                flat_grids = np.meshgrid(*[choice] * size, indexing='ij')
                 flat_grids = np.array(flat_grids).reshape(size, -1).T
                 choices = [g.reshape(shape).astype(np.int64) for g in flat_grids]
             
@@ -207,7 +161,7 @@ class DiscreteActionWrapper(gym.ActionWrapper):
         action_lut = []
         for joint in itertools.product(*per_key_choices):
             action_lut.append({
-                k: v.item() if np.asarray(v).shape == () else v
+                k: v.item() if np.asarray(v).shape == () else v 
                 for k, v in zip(keys, joint)
             })
 
@@ -218,7 +172,7 @@ class DiscreteActionWrapper(gym.ActionWrapper):
     def action(self, action: int) -> ArrayDict:
         '''Maps a discrete action index to the corresponding action dict from the LUT.'''
         idx = int(action)
-        if idx < 0 or idx >= len(self._action_lut):
-            raise ValueError(
-                f'Action index {idx} out of bounds [0, {len(self._action_lut) - 1}].')
+        n = len(self._action_lut)
+        if idx < 0 or idx >= n:
+            raise ValueError(f'Action index {idx} out of bounds [0, {n - 1}].')
         return self._action_lut[idx]

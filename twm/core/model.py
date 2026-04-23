@@ -2,8 +2,9 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from twm.core.encoding import SinePositionalEncoding, RotaryTransformerEncoderLayer
 from twm.core.projection import (
@@ -34,7 +35,7 @@ class EMA:
 
     @property
     def state_dict(self) -> TensorDict:
-        '''Returns the EMA weights as a state dictionary, moved to the appropriate device.'''
+        '''Returns the EMA weights as a state dict, moved to the appropriate device.'''
         return {k: v.to(self.device) for k, v in self.weights.items()}
 
 
@@ -49,7 +50,7 @@ class WorldModel(nn.Module):
         super().__init__()
 
         self.env_spec = env_spec
-        self.input_specs = {**env_spec.state_spec, **env_spec.action_spec}
+        self.all_spec = env_spec.all_spec
         self.seq_len = seq_len
         self.d_model = d_model
         self.nhead = nhead
@@ -61,25 +62,8 @@ class WorldModel(nn.Module):
         self.use_rope = use_rope
         
         # (state, action) -> (d_model,) embedding -> next state prediction
-        self.encoders = nn.ModuleDict()
-        self.decoders = nn.ModuleDict()
-        self.loss_fns = nn.ModuleDict()
-        for key, spec in self.input_specs.items():
-            if spec.prange == 'pixel':
-                self.encoders[key] = ImageEncoder(spec.shape, d_model)
-                if key in env_spec.state_spec:
-                    self.decoders[key] = ImageDecoder(spec.shape, d_model)
-                    self.loss_fns[key] = nn.BCELoss()
-            else:
-                self.encoders[key] = VectorEncoder(spec.shape, d_model)
-                if key in env_spec.state_spec:
-                    self.decoders[key] = VectorDecoder(spec.shape, d_model)
-                    self.loss_fns[key] = nn.HuberLoss()
-        
-        # combine encoder embeddings into a single latent
+        self._create_encoders_and_decoders_from_spec()
         self.input_proj = nn.Linear(len(self.encoders) * d_model, d_model)
-        
-        # Keep input feature scaling stable regardless of transformer norm mode
         self.input_norm = nn.LayerNorm(d_model)
 
         # learnable special tokens in embedding space
@@ -120,115 +104,129 @@ class WorldModel(nn.Module):
         self.output_norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
         
         # placeholder normalizer buffers
-        for key, spec in self.input_specs.items():
+        for key, spec in self.all_spec.items():
             self.register_buffer(f'{key}_mean', torch.zeros(spec.shape))
             self.register_buffer(f'{key}_std', torch.ones(spec.shape))
-            self.register_buffer(f'{key}_norm', torch.tensor(True, dtype=torch.bool))
+            self.register_buffer(f'{key}_norm', torch.tensor(False, dtype=torch.bool))
+
+    def _create_encoders_and_decoders_from_spec(self):
+        d_model = self.d_model
+        self.encoders = nn.ModuleDict()
+        self.decoders = nn.ModuleDict()
+        self.loss_fns = nn.ModuleDict()
+
+        for key, spec in self.all_spec.items():
+
+            # use CNN layers for pixels
+            if spec.prange == 'pixel':
+                self.encoders[key] = ImageEncoder(spec.shape, d_model)
+                if key in self.env_spec.state_spec:
+                    self.decoders[key] = ImageDecoder(spec.shape, d_model)
+                    self.loss_fns[key] = nn.BCELoss()
             
+            # use MLP layers for real-valued states, with Huber loss
+            elif spec.prange == 'real':
+                self.encoders[key] = VectorEncoder(spec.shape, d_model)
+                if key in self.env_spec.state_spec:
+                    self.decoders[key] = VectorDecoder(spec.shape, d_model)
+                    self.loss_fns[key] = nn.HuberLoss()
+            
+            # use one-hot encoding and cross entropy for discrete actions
+            elif spec.prange in ('int', 'bool'):
+                values = spec.values
+                if spec.prange == 'bool':
+                    values = (0, 1)
+                assert values is not None and len(values) == 2
+                low, high = int(values[0]), int(values[1])
+                n_classes = high - low + 1
+                new_shape = (*spec.shape, n_classes)
+                self.encoders[key] = VectorEncoder(new_shape, d_model)
+                if key in self.env_spec.state_spec:
+                    self.decoders[key] = VectorDecoder(new_shape, d_model)
+                    self.loss_fns[key] = nn.CrossEntropyLoss()
+
+            else:
+                raise ValueError(f'Unknown prange for key {key}: {spec.prange}')
+
     @property
     def device(self) -> torch.device:
         '''Convenience property to get the device of the model parameters.'''
         return next(self.parameters()).device
-
-    # <--------------------------------- data handling --------------------------------->
-
-    def set_dataset_stats(self, dataset) -> None:
-        '''Sets the normalization statistics for states and actions for the dataset.'''
-        for key in self.input_specs:
-            if key in dataset.normalizer_stats:
-                mean, std = dataset.normalizer_stats[key]
-                self.register_buffer(f'{key}_mean', mean.to(self.device))
-                self.register_buffer(f'{key}_std', std.to(self.device))
-                self.register_buffer(f'{key}_norm', torch.tensor(True, dtype=torch.bool))
-            else:
-                self.register_buffer(f'{key}_norm', torch.tensor(False, dtype=torch.bool))
-        
-    def normalize_inputs(self, inputs: TensorDict) -> TensorDict:
-        '''Normalizes inputs using the dataset statistics.'''
-        result = {}
-        for key, tensor in inputs.items():
-            if getattr(self, f'{key}_norm').item():
-                mean = getattr(self, f'{key}_mean')
-                std = getattr(self, f'{key}_std')
-                mean = mean.view(*(1,) * (tensor.ndim - mean.ndim), *mean.shape)
-                std = std.view(*(1,) * (tensor.ndim - std.ndim), *std.shape)
-                result[key] = (tensor - mean) / std
-            else:
-                result[key] = tensor
-        return result
-        
-    def unnormalize_inputs(self, inputs: TensorDict) -> TensorDict:
-        '''Unnormalizes inputs using the dataset statistics.'''
-        result = {}
-        for key, tensor in inputs.items():
-            if getattr(self, f'{key}_norm').item():
-                mean = getattr(self, f'{key}_mean')
-                std = getattr(self, f'{key}_std')
-                mean = mean.view(*(1,) * (tensor.ndim - mean.ndim), *mean.shape)
-                std = std.view(*(1,) * (tensor.ndim - std.ndim), *std.shape)
-                result[key] = tensor * std + mean
-            else:
-                result[key] = tensor
-        return result
-    
-    @torch.no_grad()
-    def pad_with_zeros(self, x: Tensor) -> Tensor:
-        '''Pads a sequence to the required context length.'''
-        x = x.clone()
-        batch, x_len, *shape = x.shape
-        if x_len >= self.seq_len:
-            return x[:, -self.seq_len:]
-        pad_len = self.seq_len - x_len
-        padding = torch.zeros(batch, pad_len, *shape, device=self.device)
-        return torch.cat([x, padding], dim=1)
 
     # <--------------------------------- mask handling --------------------------------->
 
     @torch.no_grad()
     def make_padding_mask(self, pad_lens: Tensor, seq_len: int) -> Tensor:
         '''Creates a boolean mask indicating padding positions in the input sequence.'''
-        pos = torch.arange(seq_len, device=self.device)
+        pos = torch.arange(seq_len, device=pad_lens.device)
         mask = pos.unsqueeze(0) >= (seq_len - pad_lens).unsqueeze(1)  # (batch, seq_len)
         return mask
     
     @torch.no_grad()
     def make_full_mask(self, pad_lens: Tensor, seq_len: int, batch: int) -> Tensor:
         '''Creates a combined mask that incorporates causal and padding masking.'''
-        device = self.device
-
         # create causal mask
         causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            seq_len, device=device)
+            seq_len, device=pad_lens.device)
 
         # add padding mask to causal mask
         pad_mask_ = self.make_padding_mask(pad_lens, seq_len)   # (batch, seq_len)
-        padding_mask = torch.zeros(batch, 1, seq_len, device=device)
+        padding_mask = torch.zeros(batch, 1, seq_len, device=pad_lens.device)
         padding_mask = padding_mask.masked_fill(pad_mask_.unsqueeze(1), float('-inf'))
         mask = causal_mask.unsqueeze(0) + padding_mask   # (batch, seq_len, seq_len)
 
         # ensure padded positions can attend to themselves to prevent NaNs
-        eye = torch.eye(seq_len, dtype=torch.bool, device=device)
+        eye = torch.eye(seq_len, dtype=torch.bool, device=pad_lens.device)
         mask = mask.masked_fill(pad_mask_.unsqueeze(-1) & eye, 0.0)
         mask = mask.unsqueeze(1).expand(-1, self.nhead, -1, -1)
         mask = mask.reshape(batch * self.nhead, seq_len, seq_len)
         return mask
 
-    # <---------------------------------- transformer ---------------------------------->
+    # <---------------------------------- prediction ---------------------------------->
 
+    def prepare_inputs(self, inputs: TensorDict) -> TensorDict:
+        '''Prepares inputs to feed to the transformer.'''
+        result = {}
+        for key, tensor in inputs.items():
+            spec = self.all_spec[key]
+
+            # pixel values fed directly
+            if spec.prange == 'pixel':
+                result[key] = tensor.float()
+
+            # reals normalized with dataset stats
+            elif spec.prange == 'real':
+                mean = getattr(self, f'{key}_mean')
+                std = getattr(self, f'{key}_std')
+                mean = mean.view(*(1,) * (tensor.ndim - mean.ndim), *mean.shape)
+                std = std.view(*(1,) * (tensor.ndim - std.ndim), *std.shape)
+                result[key] = (tensor.float() - mean) / std
+            
+            # discrete converted to one-hot vectors
+            elif spec.prange in ('int', 'bool'):
+                values = spec.values
+                if spec.prange == 'bool':
+                    values = (0, 1)
+                assert values is not None and len(values) == 2
+                low, high = int(values[0]), int(values[1])
+                result[key] = F.one_hot(tensor.long() - low, high - low + 1).float()
+                
+        return result
+        
     def embed_inputs(self, states: TensorDict, actions: TensorDict) -> Tensor:
         '''Projects states and actions into the transformer input space.'''
         # filter and normalize inputs
-        states = {k: v for k, v in states.items() if k in self.env_spec.state_spec}
-        actions = {k: v for k, v in actions.items() if k in self.env_spec.action_spec}
-        states = self.normalize_inputs(states)
-        actions = self.normalize_inputs(actions)
+        states = {k: states[k] for k in self.env_spec.state_spec}
+        actions = {k: actions[k] for k in self.env_spec.action_spec}
+        states = self.prepare_inputs(states)
+        actions = self.prepare_inputs(actions)
         
         # embed each state and action separately
         state_enc = [self.encoders[k](v) for k, v in states.items()]
         action_enc = [self.encoders[k](v) for k, v in actions.items()]
 
         # concatenate all embeddings and project to the embedding space
-        x = torch.cat(state_enc + action_enc, dim=-1)  # (batch, seq_len, n_input * d_model)
+        x = torch.cat(state_enc + action_enc, dim=-1)  # (batch, seq_len, num * d_model)
         x = self.input_proj(x)   # (batch, seq_len, d_model)
         return x
     
@@ -262,7 +260,7 @@ class WorldModel(nn.Module):
         # select the latents corresponding to the last real tokens
         batch, seq_len = latents.shape[:2]
         last_real_idx = (seq_len - pad_lens - 1).clamp(min=0)
-        batch_idx = torch.arange(batch, device=self.device)
+        batch_idx = torch.arange(batch, device=latents.device)
         last_latent = latents[batch_idx, last_real_idx]
 
         # choose latents depending on the decoder's conditioning mode
@@ -276,8 +274,39 @@ class WorldModel(nn.Module):
                 raise ValueError(f'Invalid condition mode: {decoder.condition_mode}')
         return result_latents
 
+    def prepare_outputs(self, inputs: TensorDict) -> TensorDict:
+        '''Prepares outputs using the dataset statistics.'''
+        result = {}
+        for key, tensor in inputs.items():
+            spec = self.all_spec[key]
+
+            # pixel values fed directly
+            if spec.prange == 'pixel':
+                result[key] = tensor.float()
+
+            # real outputs rescaled back to original range
+            elif spec.prange == 'real':
+                mean = getattr(self, f'{key}_mean')
+                std = getattr(self, f'{key}_std')
+                mean = mean.view(*(1,) * (tensor.ndim - mean.ndim), *mean.shape)
+                std = std.view(*(1,) * (tensor.ndim - std.ndim), *std.shape)
+                result[key] = tensor.float() * std + mean
+            
+            # discrete outputs converted from one-hot vectors back to integer values
+            elif spec.prange in ('int', 'bool'):
+                values = spec.values
+                assert values is not None and len(values) == 2
+                if spec.prange == 'bool':
+                    values = (0, 1)
+                low, high = int(values[0]), int(values[1])
+                idx = tensor.argmax(dim=-1)
+                assert idx.max() < (high - low + 1)
+                result[key] = idx + low
+
+        return result
+    
     def forward(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor,
-                return_latent: bool=False, unnormalize: bool=False) -> TensorDict:
+                return_latent: bool=False, decode_output: bool=False) -> TensorDict:
         '''Predicts the next state or latent given a history of states and actions.'''
         # encode the history of states and actions into latents
         latents = self.encode_history(states, actions, pad_lens)
@@ -286,59 +315,73 @@ class WorldModel(nn.Module):
             return latents
         
         # decode the latents into next state predictions for each observed key
-        next_states = {}
-        for key, decoder in self.decoders.items():
-            if key not in self.env_spec.state_spec:
-                raise ValueError(f'Decoder key not in state spec: {key}')
-            next_states[key] = decoder(latents[key])
-        if unnormalize:
-            next_states = self.unnormalize_inputs(next_states)
+        next_states = {k: self.decoders[k](latents[k]) for k in self.env_spec.state_spec}
+        if decode_output:
+            next_states = self.prepare_outputs(next_states)
         return next_states
     
     # <---------------------------- training and evaluation ----------------------------->
 
-    def to_device(self, values: TensorDict) -> TensorDict:
-        '''Moves a dictionary of tensors to the same device and dtype as the model.'''
-        return {k: v.to(self.device) for k, v in values.items()}
-    
+    def set_dataset_stats(self, dataset) -> None:
+        '''Sets the normalization statistics for states and actions for the dataset.'''
+        device = self.device
+        for key in self.all_spec:
+            if key in dataset.normalizer_stats:
+                mean, std = dataset.normalizer_stats[key]
+                self.register_buffer(f'{key}_mean', mean.to(device))
+                self.register_buffer(f'{key}_std', std.to(device))
+                self.register_buffer(f'{key}_norm', torch.tensor(True, dtype=torch.bool))
+            else:
+                self.register_buffer(f'{key}_norm', torch.tensor(False, dtype=torch.bool))
+                    
     def loss(self, states: TensorDict, actions: TensorDict, next_states: TensorDict, 
              pad_lens: Tensor) -> Tensor:
         '''Computes the loss between predicted and true next states.'''
         # normalize inputs as targets
-        targets = {k: v for k, v in next_states.items() if k in self.env_spec.state_spec}
-        targets = self.normalize_inputs(targets)
+        targets = {k: next_states[k] for k in self.env_spec.state_spec}
+        targets = self.prepare_inputs(targets)
 
         # predict next states from the model
-        preds = self.forward(states, actions, pad_lens, unnormalize=False)
-        assert isinstance(preds, dict), 'Model output must be a dict.'
+        preds = self.forward(states, actions, pad_lens, decode_output=False)
 
         # compute loss across all state keys and sum
-        loss = torch.tensor(0., device=self.device)
-        for key in targets.keys():
-            loss += self.loss_fns[key](preds[key], targets[key])
+        loss = torch.tensor(0., device=pad_lens.device)
+        for key in targets:
+            pred, target = preds[key], targets[key]
+            if self.all_spec[key].prange in ('int', 'bool'):  # for cross-entropy
+                pred = pred.movedim(-1, 1)
+                target = target.movedim(-1, 1)
+            loss += self.loss_fns[key](pred, target)
         return loss
-    
+
+    @staticmethod
+    def dict_to_device(values: TensorDict, device: torch.device) -> TensorDict:
+        '''Moves a dictionary of tensors to the same device and dtype as the model.'''
+        return {k: v.to(device) for k, v in values.items()}
+        
     @torch.no_grad()
     def evaluate(self, data_loader) -> float:
         '''Evaluates the model on a test dataset and returns the average loss.'''
         self.eval()
+        device = self.device
         
         if data_loader is None: 
             return float('nan')
 
         loss = 0.
         for batch_data in tqdm(data_loader, desc='Evaluating'):
-            states = self.to_device(batch_data['states'])
-            actions = self.to_device(batch_data['actions'])
-            next_states = self.to_device(batch_data['next_states'])
-            pad_lens = batch_data['pad'].to(self.device)
+            states = self.dict_to_device(batch_data['states'], device)
+            actions = self.dict_to_device(batch_data['actions'], device)
+            next_states = self.dict_to_device(batch_data['next_states'], device)
+            pad_lens = batch_data['pad'].to(device)
             loss += self.loss(states, actions, next_states, pad_lens).item()
         return loss / len(data_loader)
 
     def fit(self, train_data_loader, epochs: int, 
             optimizer=torch.optim.Adam, lr: float=1e-3, lr_decay: float=0.9, 
             test_data_loader=None, model_name: str='') -> None:
-        '''Trains the world model, optionally evaluating on a test dataset.'''        
+        '''Trains the world model, optionally evaluating on a test dataset.'''      
+        device = self.device  
         self.set_dataset_stats(train_data_loader.dataset)
 
         # create optimizer and learning rate scheduler
@@ -355,10 +398,10 @@ class WorldModel(nn.Module):
             # training loop
             epoch_loss = 0.
             for batch_data in tqdm(train_data_loader, desc=f'Epoch {epoch+1}/{epochs}'):
-                states = self.to_device(batch_data['states'])
-                actions = self.to_device(batch_data['actions'])
-                next_states = self.to_device(batch_data['next_states'])
-                pad_lens = batch_data['pad'].to(self.device)
+                states = self.dict_to_device(batch_data['states'], device)
+                actions = self.dict_to_device(batch_data['actions'], device)
+                next_states = self.dict_to_device(batch_data['next_states'], device)
+                pad_lens = batch_data['pad'].to(device)
                 loss = self.loss(states, actions, next_states, pad_lens)
 
                 optim.zero_grad()
@@ -428,53 +471,57 @@ class WorldModelEvaluator:
 
     def __init__(self, model: WorldModel) -> None:
         self.model = model
+        self.seq_len = model.seq_len
         self.device = model.device
+
+    @torch.no_grad()
+    def pad_with_zeros(self, x: Tensor) -> Tensor:
+        '''Pads a sequence to the required context length.'''
+        x = x.to(self.device).clone()
+        batch, x_len, *shape = x.shape
+        if x_len >= self.seq_len:
+            return x[:, -self.seq_len:]
+        pad_len = self.seq_len - x_len
+        padding = torch.zeros(batch, pad_len, *shape, device=self.device)
+        return torch.cat([x, padding], dim=1)
 
     @torch.no_grad()
     def reset(self, init_states: TensorDict, init_actions: Optional[TensorDict]) -> None:
         '''Resets the rollout context with initial states and actions.'''
-        device = self.device
-
-        # ensure batch dimension and get batch size and initial sequence length
-        batch, init_len = next(iter(init_states.values())).shape[:2]
+        spec = self.model.env_spec
+        
+        # calculate initial padding lengths based on the length of the initial states
+        self.batch, init_len = next(iter(init_states.values())).shape[:2]
         assert init_len >= 1, 'reset requires at least one initial timestep.'
+        self.pad_len = max(self.seq_len - init_len, 0)
 
         # extract only the observed states, pad to required length and store in buffer
-        self.states = {}
-        for key in self.model.env_spec.state_spec:  
-            tensor = init_states[key].to(device)
-            self.states[key] = self.model.pad_with_zeros(tensor)
+        self.states = {k: self.pad_with_zeros(init_states[k]) for k in spec.state_spec}
 
         # pad initial actions to required sequence length and store in context buffer
         if init_actions is None:
             assert init_len == 1, 'Must pass single initial state.'
             self.actions = {
-                k: torch.zeros(batch, self.model.seq_len, *spec.shape, device=device)
-                for k, spec in self.model.env_spec.action_spec.items()
+                k: torch.zeros(self.batch, self.seq_len, *spec.shape, device=self.device)
+                for k, spec in spec.action_spec.items()
             }
         else:
-            self.actions = {}
-            for key in self.model.env_spec.action_spec:
-                tensor = init_actions[key].to(device)
-                self.actions[key] = self.model.pad_with_zeros(tensor)
-                
-        # calculate initial padding lengths based on the initial sequence length
-        init_pad = max(0, self.model.seq_len - init_len)
-        self.pad_lens = torch.full((batch,), init_pad, dtype=torch.long, device=device)
+            self.actions = {
+                k: self.pad_with_zeros(init_actions[k]) for k in spec.action_spec
+            }
 
-    def index_into_last_epoch(self) -> Tuple[Tensor, Tensor]:
-        '''Calculates the indices into the last real state, accounting for padding.'''
-        last_real_idx = (self.model.seq_len - self.pad_lens - 1).clamp(min=0)
-        batch = next(iter(self.states.values())).size(0)
-        batch_idx = torch.arange(batch, device=self.device)
-        return batch_idx, last_real_idx
-
-    def last_states(self, to_numpy: bool=False) -> ArrayDict | TensorDict:
+    def index_of_last_epoch(self) -> int:
+        '''Calculates the index into the last real state, accounting for padding.'''
+        return max(self.seq_len - self.pad_len - 1, 0)
+    
+    def last_states(self, to_numpy: bool=False, squash: bool=False) -> ArrayDict | TensorDict:
         '''Extracts the last real states from the rollout context.'''
-        batch_idx, last_real_idx = self.index_into_last_epoch()
+        last_idx = self.index_of_last_epoch()
         result = {}
         for key, tensor in self.states.items():
-            value = tensor[batch_idx, last_real_idx]
+            value = tensor[:, last_idx]
+            if squash:
+                value = value.squeeze(0)
             if to_numpy:
                 value = value.detach().cpu().numpy()
             result[key] = value
@@ -483,58 +530,48 @@ class WorldModelEvaluator:
     @torch.no_grad()
     def step(self, actions: TensorDict) -> TensorDict:
         '''Performs a rollout step by feeding the current context into the model to 
-        predict the next state, then updating the context with the new state and action.'''
+        predict the next state, then updating with the new state and action.'''
         self.model.eval()
 
         # set actions at the last real token position for each batch item
-        batch_idx, last_real_idx = self.index_into_last_epoch()
-        for key, tensor in self.actions.items():
-            tensor[batch_idx, last_real_idx] = actions[key]
+        last_idx = self.index_of_last_epoch()
+        for key, tensor in actions.items():
+            self.actions[key][:, last_idx] = tensor
 
         # predict next state using the model
+        pad_lens = torch.full((self.batch,), self.pad_len, device=self.device)
         next_states = self.model.forward(
-            self.states, self.actions, self.pad_lens, unnormalize=True)
+            self.states, self.actions, pad_lens, decode_output=True)
         assert isinstance(next_states, dict), 'Model output must be a dict.'
 
-        # for indices with padding, write next index directly into the buffer
-        has_pad = self.pad_lens > 0
-        if torch.any(has_pad):
-            append_idx = last_real_idx[has_pad] + 1
-            for key, tensor in self.states.items():
-                tensor[has_pad, append_idx] = next_states[key][has_pad]
-        
-        # for indices without padding, shift left and append at the end
-        if torch.any(~has_pad):
-            for key, tensor in self.states.items():
-                tensor[~has_pad] = torch.roll(tensor[~has_pad], -1, dims=1)
-                tensor[~has_pad, -1] = next_states[key][~has_pad]
-            for key, tensor in self.actions.items():
-                tensor[~has_pad] = torch.roll(tensor[~has_pad], -1, dims=1)
+        # if there is no padding, roll the state and action buffers
+        if self.pad_len == 0:
+            self.states = {k: torch.roll(v, -1, dims=1) for k, v in self.states.items()}
+            self.actions = {k: torch.roll(v, -1, dims=1) for k, v in self.actions.items()}
+            state_write_index = -1
+        else:
+            state_write_index = last_idx + 1
+
+        # write the new states into the buffer at the appropriate position
+        for key, tensor in next_states.items():
+            self.states[key][:, state_write_index] = tensor
         
         # reduce padding lengths by 1, ensuring they don't go below 0
-        self.pad_lens = (self.pad_lens - 1).clamp(min=0)
+        self.pad_len = max(self.pad_len - 1, 0)
 
-        return {key: next_states[key] for key in self.states}
+        return next_states
     
     @torch.no_grad()
     def rollout(self, init_states: TensorDict, init_actions: Optional[TensorDict], 
-                vec_policy, max_steps: int) -> TensorDict:
+                policy, max_steps: int) -> TensorDict:
         '''Performs a rollout using the world model and a given policy.'''
-        device = self.device
         self.reset(init_states, init_actions)
         
         trajectories = {}
         for _ in tqdm(range(max_steps), desc='Rollout'):
-
-            # use the policy to select the next action based on the last real state
-            last_states_np = self.last_states(to_numpy=True)
-            actions = {
-                k: torch.from_numpy(v).float().to(device) 
-                for k, v in vec_policy(last_states_np).items()
-            }
-            
-            # perform a rollout step with the selected actions to get the next states
-            for key, tensor in self.step(actions).items():
+            actions = policy(self.last_states())
+            next_states = self.step(actions)
+            for key, tensor in next_states.items():
                 trajectories.setdefault(key, []).append(tensor.detach().cpu())
 
         return {k: torch.stack(vs, dim=1) for k, vs in trajectories.items()}

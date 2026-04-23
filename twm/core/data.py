@@ -43,7 +43,7 @@ def dict_to_array(src: TensorDict) -> ArrayDict:
 
 def dict_to_tensor(src: ArrayDict) -> TensorDict:
     '''Converts a dict of numpy arrays into a dict of PyTorch tensors.'''
-    return {k: torch.from_numpy(v).float() for k, v in src.items()}
+    return {k: torch.from_numpy(v) for k, v in src.items()}
 
 
 def _create_obs(state, env, env_spec, image_map):
@@ -166,30 +166,19 @@ class SequenceDataset(torch.utils.data.Dataset):
         '''Calculates mean and std for states and actions across the entire dataset.'''
         env_spec = episodes[0]['spec']
 
-        states, actions = {}, {}
+        values = {}
         for ep in episodes:
-            dict_append(ep['next_states'], states)
-            dict_append(ep['actions'], actions)
+            dict_append(ep['next_states'], values)
+            dict_append(ep['actions'], values)
 
         # calculate data set stats for state
         stats = {}
-        for key, values in states.items():
-            spec = env_spec.state_spec[key]
-            if spec.prange in ('int', 'real'):
-                all_states = torch.from_numpy(np.concatenate(values, axis=0)).float()
-                state_mean = all_states.mean(dim=0).reshape(spec.shape)
-                state_std = all_states.std(dim=0).clamp(min=1e-8).reshape(spec.shape)
-                stats[key] = (state_mean, state_std)
-        
-        # calculate data set stats for action       
-        for key, values in actions.items():
-            spec = env_spec.action_spec[key]
-            if spec.prange in ('int', 'real'):
-                all_actions = torch.from_numpy(np.concatenate(values, axis=0)).float()
-                action_mean = all_actions.mean(dim=0).reshape(spec.shape)
-                action_std = all_actions.std(dim=0).clamp(min=1e-8).reshape(spec.shape)
-                stats[key] = (action_mean, action_std)
-
+        for key, spec in env_spec.all_spec.items():
+            if spec.prange == 'real':
+                all_vals = torch.from_numpy(np.concatenate(values[key], axis=0)).float()
+                mean = all_vals.mean(dim=0).reshape(spec.shape)
+                std = all_vals.std(dim=0).clamp(min=1e-8).reshape(spec.shape)
+                stats[key] = (mean, std)
         return stats
 
     # <------------------------------- Data sampling  ------------------------------>

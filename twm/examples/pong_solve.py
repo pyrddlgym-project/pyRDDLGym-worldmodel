@@ -17,7 +17,7 @@ def create_world_model_env():
 def run_random_shooting_agent():
     rollout_env = create_world_model_env()
     eval_env = pyRDDLGym.make("Pong_arcade", '1', vectorized=True)
-    mpc = RandomShootingMPC(rollout_env, eval_env, lookahead=50)
+    mpc = RandomShootingMPC(rollout_env, eval_env, lookahead=40)
     mpc.run('pong_random_shooting.gif', save_frames=True, episodes=1)
 
 

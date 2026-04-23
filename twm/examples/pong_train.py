@@ -15,7 +15,7 @@ state_spec = {
     'paddle-y': FluentSpec(shape=(1,), prange='real'),
 }
 action_spec = {
-    'move': FluentSpec(shape=(), prange='int', values=[-1, 0, 1]),
+    'move': FluentSpec(shape=(), prange='int', values=(-1, +1)),
 }
 env_spec = EnvSpec(state_spec=state_spec, action_spec=action_spec)
 
@@ -60,14 +60,14 @@ class PongPolicy(BaseAgent):
 
 
 def vec_policy(states):
-    ball_y = states['ball-y'][:, 0]
-    paddle_y = states['paddle-y']
-    actions = np.zeros((len(states['ball-y']), 1), dtype=np.float32)
+    ball_y = states['ball-y'][:, 0].detach().cpu().numpy()
+    paddle_y = states['paddle-y'][:, 0].detach().cpu().numpy()
+    actions = np.zeros((len(ball_y),), dtype=np.int32)
     actions[ball_y < paddle_y + 0.05] = np.where(
         np.random.rand((ball_y < paddle_y + 0.05).sum()) < 0.85, -1, 1)
     actions[ball_y > paddle_y + 0.05] = np.where(
         np.random.rand((ball_y > paddle_y + 0.05).sum()) < 0.85, 1, -1)
-    return {'move': actions}    
+    return {'move': torch.from_numpy(actions)}    
 
 
 def create_pong_data(episodes=500, max_steps=200, save_path='pong_data.pkl'):
@@ -109,7 +109,7 @@ if __name__ == "__main__":
             'pong_data.pkl', seq_len, batch_size=64, augment_starts=False)
    
         model = WorldModel(env_spec=env_spec, seq_len=seq_len).to('cuda')
-        model.fit(train_loader, lr=0.001, epochs=3, test_data_loader=test_loader, 
+        model.fit(train_loader, lr=0.001, epochs=600, test_data_loader=test_loader, 
                   model_name=f'pong_world_model_{seq_len}.pth')
     
     else:

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 @dataclass
@@ -8,8 +8,7 @@ class FluentSpec:
     '''A dataclass to specify the properties of a state or action variable.'''
     shape: Tuple[int, ...]
     prange: str    # real, int, bool, pixel
-    values: Optional[List[Any] | Tuple[Any, Any]] = None   # list of values for int, 
-                                                           # (low, high) range for real
+    values: Optional[Tuple[int | float, int | float]] = None   # (low, high) inclusive
 
     @property
     def size(self) -> int:
@@ -40,6 +39,11 @@ class EnvSpec:
     state_spec: Dict[str, FluentSpec]
     action_spec: Dict[str, FluentSpec]
 
+    @property
+    def all_spec(self) -> Dict[str, FluentSpec]:
+        '''Returns a combined dict of all state and action specs.'''
+        return {**self.state_spec, **self.action_spec}
+    
     def serialize(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
         '''Converts EnvSpec to plain Python types for safe checkpoint serialization.'''
         return {
