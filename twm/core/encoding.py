@@ -49,8 +49,8 @@ class RotaryPositionalEmbedding(nn.Module):
         seq_len = q.size(-2)
         cos = self.cos[:seq_len].to(device=q.device, dtype=q.dtype)
         sin = self.sin[:seq_len].to(device=q.device, dtype=q.dtype)
-        cos = torch.repeat_interleave(cos, 2, dim=-1).unsqueeze(0).unsqueeze(0)
-        sin = torch.repeat_interleave(sin, 2, dim=-1).unsqueeze(0).unsqueeze(0)
+        cos = torch.repeat_interleave(cos, 2, dim=-1)[None, None]
+        sin = torch.repeat_interleave(sin, 2, dim=-1)[None, None]
         q = q * cos + self._rotate_half(q) * sin
         k = k * cos + self._rotate_half(k) * sin
         return q, k

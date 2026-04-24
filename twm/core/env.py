@@ -139,7 +139,6 @@ class DiscreteActionWrapper(gym.ActionWrapper):
                 if values is None or len(values) != 2:
                     raise ValueError(f'Int action {key} must have values.')
                 low, high = int(values[0]), int(values[1])
-                n = high - low + 1
                 choice = np.arange(low, high + 1, dtype=np.int64)
             else:
                 raise ValueError(

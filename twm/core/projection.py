@@ -62,14 +62,17 @@ class VectorDecoder(nn.Module):
 class ImageEncoder(nn.Module):
     '''A CNN to encode images into a (d_model,) embedding.'''
 
-    def __init__(self, image_shape: Shape, d_model: int, 
-                 sizes: Tuple[int, ...]=(32, 64, 128)) -> None:
+    def __init__(self, image_shape: Shape, d_model: int,
+                 sizes: Tuple[int, ...]=(32, 64, 128),
+                 bottleneck_hw: Tuple[int, int]=(8, 8)) -> None:
         super().__init__()
 
         if len(sizes) == 0:
             raise ValueError('sizes must not be empty.')
         if len(image_shape) != 3:
             raise ValueError('Image_shape should be (C, H, W).')
+        if len(bottleneck_hw) != 2:
+            raise ValueError('bottleneck_hw should be (H, W).')
         
         # create conv layers
         conv_layers = []
@@ -81,9 +84,9 @@ class ImageEncoder(nn.Module):
 
         self.encoder = nn.Sequential(
             *conv_layers,
-            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.AdaptiveAvgPool2d(bottleneck_hw),
             nn.Flatten(),
-            nn.Linear(sizes[-1] * 4 * 4, 4 * d_model),
+            nn.Linear(sizes[-1] * bottleneck_hw[0] * bottleneck_hw[1], 4 * d_model),
             nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
@@ -101,15 +104,16 @@ class ImageDecoder(nn.Module):
     condition_mode = 'last'
 
     def __init__(self, image_shape: Shape, d_model: int,
-                 sizes: Tuple[int, ...]=(256, 128, 64, 32), 
-                 min_value: float=1e-6) -> None:
+                 sizes: Tuple[int, ...]=(256, 128, 64, 32),
+                 bottleneck_hw: Tuple[int, int]=(8, 8)) -> None:
         super().__init__()
-        self.min_value = min_value
 
         if len(sizes) == 0:
             raise ValueError('sizes must not be empty.')
         if len(image_shape) != 3:
             raise ValueError('Image_shape should be (C, H, W).')
+        if len(bottleneck_hw) != 2:
+            raise ValueError('bottleneck_hw should be (H, W).')
         
         # create conv layers
         c, h, w = image_shape
@@ -129,16 +133,14 @@ class ImageDecoder(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
-            nn.Linear(d_model * 4, sizes[0] * 4 * 4),
+            nn.Linear(d_model * 4, sizes[0] * bottleneck_hw[0] * bottleneck_hw[1]),
             nn.GELU(),
-            nn.Unflatten(1, (sizes[0], 4, 4)),
+            nn.Unflatten(1, (sizes[0], bottleneck_hw[0], bottleneck_hw[1])),
             *conv_layers,
-            nn.Sigmoid(),
         )
     
     def forward(self, x: Tensor) -> Tensor:
         assert x.dim() == 2, 'Decoder input should be (batch, d_model).'
         dec = self.decoder(x)
-        dec = dec.clamp(self.min_value, 1.0 - self.min_value)
         return dec
     

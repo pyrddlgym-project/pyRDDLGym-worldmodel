@@ -117,12 +117,12 @@ class WorldModel(nn.Module):
 
         for key, spec in self.all_spec.items():
 
-            # use CNN layers for pixels
+            # use CNN layers for pixels, with binary cross-entropy loss
             if spec.prange == 'pixel':
                 self.encoders[key] = ImageEncoder(spec.shape, d_model)
                 if key in self.env_spec.state_spec:
                     self.decoders[key] = ImageDecoder(spec.shape, d_model)
-                    self.loss_fns[key] = nn.BCELoss()
+                    self.loss_fns[key] = nn.BCEWithLogitsLoss()
             
             # use MLP layers for real-valued states, with Huber loss
             elif spec.prange == 'real':
@@ -282,7 +282,7 @@ class WorldModel(nn.Module):
 
             # pixel values fed directly
             if spec.prange == 'pixel':
-                result[key] = tensor.float()
+                result[key] = torch.sigmoid(tensor).float()
 
             # real outputs rescaled back to original range
             elif spec.prange == 'real':
