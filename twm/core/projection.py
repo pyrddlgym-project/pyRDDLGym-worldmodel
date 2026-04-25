@@ -62,39 +62,27 @@ class VectorDecoder(nn.Module):
 class ImageEncoder(nn.Module):
     '''A CNN to encode images into a (d_model,) embedding.'''
 
-    def __init__(self, image_shape: Shape, d_model: int,
-                 sizes: Tuple[int, ...]=(32, 64, 128),
-                 bottleneck_hw: Tuple[int, int]=(8, 8)) -> None:
+    def __init__(self, image_shape: Shape, d_model: int) -> None:
         super().__init__()
-
-        if len(sizes) == 0:
-            raise ValueError('sizes must not be empty.')
+        
         if len(image_shape) != 3:
             raise ValueError('Image_shape should be (C, H, W).')
-        if len(bottleneck_hw) != 2:
-            raise ValueError('bottleneck_hw should be (H, W).')
-        
-        # create conv layers
-        conv_layers = []
-        in_ch = image_shape[0]
-        for out_ch in sizes:
-            conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1))
-            conv_layers.append(nn.GELU())
-            in_ch = out_ch
+        c, h, w = image_shape
 
-        self.encoder = nn.Sequential(
-            *conv_layers,
-            nn.AdaptiveAvgPool2d(bottleneck_hw),
-            nn.Flatten(),
-            nn.Linear(sizes[-1] * bottleneck_hw[0] * bottleneck_hw[1], 4 * d_model),
+        self.proj = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=4, stride=2, padding=1),
             nn.GELU(),
-            nn.Linear(4 * d_model, d_model),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, d_model),
         )
-    
+
     def forward(self, x: Tensor) -> Tensor:
         batch, seq_len, c, h, w = x.shape
         x = x.view(batch * seq_len, c, h, w)
-        enc = self.encoder(x)
+        enc = self.proj(x)
         enc = enc.view(batch, seq_len, -1)
         return enc
 
@@ -103,44 +91,33 @@ class ImageDecoder(nn.Module):
     '''A CNN to decode a (d_model,) embedding into images.'''
     condition_mode = 'last'
 
-    def __init__(self, image_shape: Shape, d_model: int,
-                 sizes: Tuple[int, ...]=(256, 128, 64, 32),
-                 bottleneck_hw: Tuple[int, int]=(8, 8)) -> None:
+    def __init__(self, image_shape: Shape, d_model: int) -> None:
         super().__init__()
 
-        if len(sizes) == 0:
-            raise ValueError('sizes must not be empty.')
         if len(image_shape) != 3:
             raise ValueError('Image_shape should be (C, H, W).')
-        if len(bottleneck_hw) != 2:
-            raise ValueError('bottleneck_hw should be (H, W).')
-        
-        # create conv layers
         c, h, w = image_shape
-        conv_layers = []
-        in_ch = sizes[0]
-        for out_ch in sizes[1:-1]:
-            conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1))
-            conv_layers.append(nn.GELU())
-            conv_layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
-            in_ch = out_ch
-        out_ch = sizes[-1]
-        conv_layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1))
-        conv_layers.append(nn.GELU())
-        conv_layers.append(nn.Upsample(size=(h, w), mode='bilinear', align_corners=False))
-        conv_layers.append(nn.Conv2d(out_ch, c, kernel_size=3, stride=1, padding=1))
 
-        self.decoder = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
             nn.GELU(),
-            nn.Linear(d_model * 4, sizes[0] * bottleneck_hw[0] * bottleneck_hw[1]),
+            nn.Linear(d_model * 2, 128 * 8 * 8),
             nn.GELU(),
-            nn.Unflatten(1, (sizes[0], bottleneck_hw[0], bottleneck_hw[1])),
-            *conv_layers,
+            nn.Unflatten(1, (128, 8, 8)),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Upsample(size=(h, w), mode='bilinear', align_corners=False),
+            nn.Conv2d(32, c, kernel_size=3, stride=1, padding=1),
         )
     
     def forward(self, x: Tensor) -> Tensor:
         assert x.dim() == 2, 'Decoder input should be (batch, d_model).'
-        dec = self.decoder(x)
+        dec = self.proj(x)
         return dec
     

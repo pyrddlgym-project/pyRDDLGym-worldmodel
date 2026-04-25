@@ -18,7 +18,7 @@ def vec_policy(states):
     return {'move': torch.as_tensor(np.random.choice([-1, 0, 1]))}    
 
 
-def create_pong_data(episodes=400, max_steps=200, save_path='pong_image_data.pkl'):
+def create_pong_data(episodes=300, max_steps=200, save_path='pong_image_data.pkl'):
     env = PongEnvWithRandomStarts()
     policy = PongPolicy()
     create_data(env, env_spec, policy, episodes, max_steps, save_path)
@@ -28,10 +28,17 @@ def plot_rollouts(model):
     env = PongEnvWithRandomStarts()
     env.reset()
     init_image = image_to_tensor(env.render())
-    init_state = {'image': torch.from_numpy(init_image).float().to('cuda')[None, None]}
+    init_action = {'move': 0}
+    env.step(init_action)
+    next_state = image_to_tensor(env.render())
+
+    images = [init_image, next_state]
+    stacked_images = np.stack(images, axis=0)[None]
+    init_state = {'image': torch.from_numpy(stacked_images).float().to('cuda')}
+    init_action = {'move': torch.as_tensor([[0]], dtype=torch.float32).to('cuda')}
     
     rollout_context = WorldModelEvaluator(model)
-    trajectories = rollout_context.rollout(init_state, None, vec_policy, max_steps=200)
+    trajectories = rollout_context.rollout(init_state, init_action, vec_policy, max_steps=200)
     trajectories = [{k: v[0].detach().cpu() for k, v in trajectories.items()}]
 
     def render_fn(state_dict):
@@ -43,14 +50,14 @@ def plot_rollouts(model):
 if __name__ == "__main__":
     # create_pong_data()
     seq_len = 8
-    fit = True
+    fit = False
 
     if fit:
         train_loader, test_loader = get_dataloader(
             'pong_image_data.pkl', seq_len, batch_size=64, augment_starts=False)
         
         model = WorldModel(env_spec, seq_len).to('cuda')
-        model.fit(train_loader, epochs=300, lr=0.0001, test_data_loader=test_loader, 
+        model.fit(train_loader, epochs=200, lr=0.0003, test_data_loader=test_loader,
                   model_name=f'pong_image_world_model_{seq_len}.pth')
     else:
         model = WorldModel.load(f'pong_image_world_model_{seq_len}.pth').to('cuda')    
