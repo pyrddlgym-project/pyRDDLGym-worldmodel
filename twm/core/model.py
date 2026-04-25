@@ -274,8 +274,12 @@ class WorldModel(nn.Module):
                 raise ValueError(f'Invalid condition mode: {decoder.condition_mode}')
         return result_latents
 
-    def prepare_outputs(self, inputs: TensorDict) -> TensorDict:
+    def prepare_outputs(self, inputs: TensorDict, stochastic: bool=False,
+                        temperature: float=1.0) -> TensorDict:
         '''Prepares outputs using the dataset statistics.'''
+        if temperature <= 0:
+            raise ValueError('temperature must be > 0.')
+
         result = {}
         for key, tensor in inputs.items():
             spec = self.all_spec[key]
@@ -299,14 +303,21 @@ class WorldModel(nn.Module):
                 if spec.prange == 'bool':
                     values = (0, 1)
                 low, high = int(values[0]), int(values[1])
-                idx = tensor.argmax(dim=-1)
+                if stochastic:
+                    probs = F.softmax(tensor.float() / temperature, dim=-1)
+                    flat_probs = probs.reshape(-1, probs.shape[-1])
+                    idx = torch.multinomial(flat_probs, num_samples=1).squeeze(-1)
+                    idx = idx.view(*probs.shape[:-1])
+                else:
+                    idx = tensor.argmax(dim=-1)
                 assert idx.max() < (high - low + 1)
                 result[key] = idx + low
 
         return result
     
     def forward(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor,
-                return_latent: bool=False, decode_output: bool=False) -> TensorDict:
+                return_latent: bool=False, decode_output: bool=False,
+            stochastic: bool=False, temperature: float=1.0) -> TensorDict:
         '''Predicts the next state or latent given a history of states and actions.'''
         # encode the history of states and actions into latents
         latents = self.encode_history(states, actions, pad_lens)
@@ -317,7 +328,8 @@ class WorldModel(nn.Module):
         # decode the latents into next state predictions for each observed key
         next_states = {k: self.decoders[k](latents[k]) for k in self.env_spec.state_spec}
         if decode_output:
-            next_states = self.prepare_outputs(next_states)
+            next_states = self.prepare_outputs(
+                next_states, stochastic=stochastic, temperature=temperature)
         return next_states
     
     # <---------------------------- training and evaluation ----------------------------->
@@ -469,10 +481,11 @@ class WorldModel(nn.Module):
 class WorldModelEvaluator:
     '''Context manager for performing rollouts with a world model.'''
 
-    def __init__(self, model: WorldModel) -> None:
+    def __init__(self, model: WorldModel, temperature: float=1.0) -> None:
         self.model = model
         self.seq_len = model.seq_len
         self.device = model.device
+        self.temperature = temperature
 
     @torch.no_grad()
     def pad_with_zeros(self, x: Tensor) -> Tensor:
@@ -541,7 +554,8 @@ class WorldModelEvaluator:
         # predict next state using the model
         pad_lens = torch.full((self.batch,), self.pad_len, device=self.device)
         next_states = self.model.forward(
-            self.states, self.actions, pad_lens, decode_output=True)
+            self.states, self.actions, pad_lens, decode_output=True, 
+            stochastic=True, temperature=self.temperature)
         assert isinstance(next_states, dict), 'Model output must be a dict.'
 
         # if there is no padding, roll the state and action buffers
