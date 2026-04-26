@@ -7,13 +7,13 @@ from tqdm import tqdm
 from typing import Any, Dict, Optional
 
 from twm.core.encoding import SinePositionalEncoding, RotaryTransformerEncoderLayer
-from twm.core.projection import (
-    VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder, Tensor, TensorDict
-)
+from twm.core.projection import VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder
 from twm.core.spec import EnvSpec
 
 Array = np.ndarray
 ArrayDict = Dict[str, Array]
+Tensor = torch.Tensor
+TensorDict = Dict[str, Tensor]
 
 PARENT_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 MODEL_PATH = os.path.join(PARENT_PATH, 'models')
@@ -37,6 +37,28 @@ class EMA:
     def state_dict(self) -> TensorDict:
         '''Returns the EMA weights as a state dict, moved to the appropriate device.'''
         return {k: v.to(self.device) for k, v in self.weights.items()}
+
+
+DEFAULT_ENCODER_TYPE = {
+    'pixel': ImageEncoder,
+    'real': VectorEncoder,
+    'int': VectorEncoder,
+    'bool': VectorEncoder,
+}
+
+DEFAULT_DECODER_TYPE = {
+    'pixel': ImageDecoder,
+    'real': VectorDecoder,
+    'int': VectorDecoder,
+    'bool': VectorDecoder,
+}
+
+DEFAULT_LOSS_FN = {
+    'pixel': nn.BCEWithLogitsLoss(),
+    'real': nn.HuberLoss(),
+    'int': nn.CrossEntropyLoss(),
+    'bool': nn.CrossEntropyLoss(),
+}
 
 
 class WorldModel(nn.Module):
@@ -116,37 +138,35 @@ class WorldModel(nn.Module):
         self.loss_fns = nn.ModuleDict()
 
         for key, spec in self.all_spec.items():
+            prange = spec.prange
+            encoder_type = DEFAULT_ENCODER_TYPE.get(prange, VectorEncoder)
+            decoder_type = DEFAULT_DECODER_TYPE.get(prange, VectorDecoder)
+            loss_fn = DEFAULT_LOSS_FN.get(prange, nn.HuberLoss())
 
             # use CNN layers for pixels, with binary cross-entropy loss
-            if spec.prange == 'pixel':
-                self.encoders[key] = ImageEncoder(spec.shape, d_model)
-                if key in self.env_spec.state_spec:
-                    self.decoders[key] = ImageDecoder(spec.shape, d_model)
-                    self.loss_fns[key] = nn.BCEWithLogitsLoss()
-            
             # use MLP layers for real-valued states, with Huber loss
-            elif spec.prange == 'real':
-                self.encoders[key] = VectorEncoder(spec.shape, d_model)
+            if prange in ('pixel', 'real'):
+                self.encoders[key] = encoder_type(spec.shape, d_model)
                 if key in self.env_spec.state_spec:
-                    self.decoders[key] = VectorDecoder(spec.shape, d_model)
-                    self.loss_fns[key] = nn.HuberLoss()
+                    self.decoders[key] = decoder_type(spec.shape, d_model)
+                    self.loss_fns[key] = loss_fn
             
             # use one-hot encoding and cross entropy for discrete actions
-            elif spec.prange in ('int', 'bool'):
+            elif prange in ('int', 'bool'):
                 values = spec.values
-                if spec.prange == 'bool':
+                if prange == 'bool':
                     values = (0, 1)
                 assert values is not None and len(values) == 2
                 low, high = int(values[0]), int(values[1])
                 n_classes = high - low + 1
                 new_shape = (*spec.shape, n_classes)
-                self.encoders[key] = VectorEncoder(new_shape, d_model)
+                self.encoders[key] = encoder_type(new_shape, d_model)
                 if key in self.env_spec.state_spec:
-                    self.decoders[key] = VectorDecoder(new_shape, d_model)
-                    self.loss_fns[key] = nn.CrossEntropyLoss()
+                    self.decoders[key] = decoder_type(new_shape, d_model)
+                    self.loss_fns[key] = loss_fn
 
             else:
-                raise ValueError(f'Unknown prange for key {key}: {spec.prange}')
+                raise ValueError(f'Unknown prange for key {key}: {prange}')
 
     @property
     def device(self) -> torch.device:
