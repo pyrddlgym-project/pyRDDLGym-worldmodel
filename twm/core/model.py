@@ -336,8 +336,8 @@ class WorldModel(nn.Module):
         return result
     
     def forward(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor,
-                return_latent: bool=False, decode_output: bool=False,
-            stochastic: bool=False, temperature: float=1.0) -> TensorDict:
+                return_latent: bool=False, decode_output: bool=False, 
+                **output_kwargs) -> TensorDict:
         '''Predicts the next state or latent given a history of states and actions.'''
         # encode the history of states and actions into latents
         latents = self.encode_history(states, actions, pad_lens)
@@ -348,8 +348,7 @@ class WorldModel(nn.Module):
         # decode the latents into next state predictions for each observed key
         next_states = {k: self.decoders[k](latents[k]) for k in self.env_spec.state_spec}
         if decode_output:
-            next_states = self.prepare_outputs(
-                next_states, stochastic=stochastic, temperature=temperature)
+            next_states = self.prepare_outputs(next_states, **output_kwargs)
         return next_states
     
     # <---------------------------- training and evaluation ----------------------------->
@@ -501,13 +500,11 @@ class WorldModel(nn.Module):
 class WorldModelEvaluator:
     '''Context manager for performing rollouts with a world model.'''
 
-    def __init__(self, model: WorldModel, temperature: float=1.0) -> None:
+    def __init__(self, model: WorldModel) -> None:
         self.model = model
         self.seq_len = model.seq_len
         self.device = model.device
-        self.temperature = temperature
 
-    @torch.no_grad()
     def pad_with_zeros(self, x: Tensor) -> Tensor:
         '''Pads a sequence to the required context length.'''
         x = x.to(self.device).clone()
@@ -518,7 +515,6 @@ class WorldModelEvaluator:
         padding = torch.zeros(batch, pad_len, *shape, device=self.device)
         return torch.cat([x, padding], dim=1)
 
-    @torch.no_grad()
     def reset(self, init_states: TensorDict, init_actions: Optional[TensorDict]) -> None:
         '''Resets the rollout context with initial states and actions.'''
         spec = self.model.env_spec
@@ -560,8 +556,8 @@ class WorldModelEvaluator:
             result[key] = value
         return result
     
-    @torch.no_grad()
-    def step(self, actions: TensorDict) -> TensorDict:
+    def step(self, actions: TensorDict, differentiable: bool=False, **output_kwargs
+             ) -> TensorDict:
         '''Performs a rollout step by feeding the current context into the model to 
         predict the next state, then updating with the new state and action.'''
         self.model.eval()
@@ -569,13 +565,15 @@ class WorldModelEvaluator:
         # set actions at the last real token position for each batch item
         last_idx = self.index_of_last_epoch()
         for key, tensor in actions.items():
-            self.actions[key][:, last_idx] = tensor
+            y = self.actions[key].clone()
+            y[:, last_idx] = tensor
+            self.actions[key] = y
 
         # predict next state using the model
         pad_lens = torch.full((self.batch,), self.pad_len, device=self.device)
-        next_states = self.model.forward(
-            self.states, self.actions, pad_lens, decode_output=True, 
-            stochastic=True, temperature=self.temperature)
+        with (torch.enable_grad() if differentiable else torch.no_grad()):
+            next_states = self.model.forward(
+                self.states, self.actions, pad_lens, decode_output=True, **output_kwargs)
         assert isinstance(next_states, dict), 'Model output must be a dict.'
 
         # if there is no padding, roll the state and action buffers
@@ -588,24 +586,27 @@ class WorldModelEvaluator:
 
         # write the new states into the buffer at the appropriate position
         for key, tensor in next_states.items():
-            self.states[key][:, state_write_index] = tensor
+            y = self.states[key].clone()
+            y[:, state_write_index] = tensor
+            self.states[key] = y
         
         # reduce padding lengths by 1, ensuring they don't go below 0
         self.pad_len = max(self.pad_len - 1, 0)
 
         return next_states
     
-    @torch.no_grad()
     def rollout(self, init_states: TensorDict, init_actions: Optional[TensorDict], 
-                policy, max_steps: int) -> TensorDict:
+                policy, max_steps: int, differentiable: bool=False, **output_kwargs
+                ) -> TensorDict:
         '''Performs a rollout using the world model and a given policy.'''
         self.reset(init_states, init_actions)
         
         trajectories = {}
         for _ in tqdm(range(max_steps), desc='Rollout'):
             actions = policy(self.last_states())
-            next_states = self.step(actions)
+            next_states = self.step(actions, differentiable=differentiable, **output_kwargs)
             for key, tensor in next_states.items():
-                trajectories.setdefault(key, []).append(tensor.detach().cpu())
-
+                tensor = tensor if differentiable else tensor.detach().cpu()
+                trajectories.setdefault(key, []).append(tensor)
+                
         return {k: torch.stack(vs, dim=1) for k, vs in trajectories.items()}
