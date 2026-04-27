@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from twm.core.encoding import SinePositionalEncoding, RotaryTransformerEncoderLayer
 from twm.core.projection import VectorEncoder, VectorDecoder, ImageEncoder, ImageDecoder
@@ -131,6 +131,15 @@ class WorldModel(nn.Module):
             self.register_buffer(f'{key}_std', torch.ones(spec.shape))
             self.register_buffer(f'{key}_norm', torch.tensor(False, dtype=torch.bool))
 
+    def spec_bounds(self, key: str) -> Tuple[int, int]:
+        '''Returns the (low, high) range of values for a given discrete key.'''
+        spec = self.all_spec[key]
+        values = (0, 1) if spec.prange == 'bool' else spec.values
+        assert values is not None and len(values) == 2, \
+            f'Expected 2 values for discrete spec {key}, got {values}'
+        low, high = int(values[0]), int(values[1])
+        return low, high
+
     def _create_encoders_and_decoders_from_spec(self):
         d_model = self.d_model
         self.encoders = nn.ModuleDict()
@@ -143,8 +152,7 @@ class WorldModel(nn.Module):
             decoder_type = DEFAULT_DECODER_TYPE.get(prange, VectorDecoder)
             loss_fn = DEFAULT_LOSS_FN.get(prange, nn.HuberLoss())
 
-            # use CNN layers for pixels, with binary cross-entropy loss
-            # use MLP layers for real-valued states, with Huber loss
+            # use CNN layers for pixels, with binary cross-entropy loss, MLP for real
             if prange in ('pixel', 'real'):
                 self.encoders[key] = encoder_type(spec.shape, d_model)
                 if key in self.env_spec.state_spec:
@@ -153,11 +161,7 @@ class WorldModel(nn.Module):
             
             # use one-hot encoding and cross entropy for discrete actions
             elif prange in ('int', 'bool'):
-                values = spec.values
-                if prange == 'bool':
-                    values = (0, 1)
-                assert values is not None and len(values) == 2
-                low, high = int(values[0]), int(values[1])
+                low, high = self.spec_bounds(key)
                 n_classes = high - low + 1
                 new_shape = (*spec.shape, n_classes)
                 self.encoders[key] = encoder_type(new_shape, d_model)
@@ -204,7 +208,17 @@ class WorldModel(nn.Module):
 
     # <---------------------------------- prediction ---------------------------------->
 
-    def prepare_inputs(self, inputs: TensorDict) -> TensorDict:
+    def one_hot(self, tensor: Tensor, key: str) -> Tensor:
+        '''Converts an int discrete tensor to a one-hot float for grad-mode buffers.'''
+        spec = self.all_spec[key]
+        if spec.prange in ('int', 'bool'):
+            low, high = self.spec_bounds(key)
+            n_classes = high - low + 1
+            return F.one_hot(tensor.long() - low, n_classes).float()
+        else:
+            return tensor.float()
+    
+    def prepare_inputs(self, inputs: TensorDict, grad: bool=False) -> TensorDict:
         '''Prepares inputs to feed to the transformer.'''
         result = {}
         for key, tensor in inputs.items():
@@ -224,22 +238,21 @@ class WorldModel(nn.Module):
             
             # discrete converted to one-hot vectors
             elif spec.prange in ('int', 'bool'):
-                values = spec.values
-                if spec.prange == 'bool':
-                    values = (0, 1)
-                assert values is not None and len(values) == 2
-                low, high = int(values[0]), int(values[1])
-                result[key] = F.one_hot(tensor.long() - low, high - low + 1).float()
+                result[key] = tensor.float() if grad else self.one_hot(tensor, key)
+            
+            else:
+                raise ValueError(f'Unknown prange for key {key}: {spec.prange}')
                 
         return result
         
-    def embed_inputs(self, states: TensorDict, actions: TensorDict) -> Tensor:
+    def embed_inputs(self, states: TensorDict, actions: TensorDict, 
+                     grad: bool=False) -> Tensor:
         '''Projects states and actions into the transformer input space.'''
         # filter and normalize inputs
         states = {k: states[k] for k in self.env_spec.state_spec}
         actions = {k: actions[k] for k in self.env_spec.action_spec}
-        states = self.prepare_inputs(states)
-        actions = self.prepare_inputs(actions)
+        states = self.prepare_inputs(states, grad=grad)
+        actions = self.prepare_inputs(actions, grad=grad)
         
         # embed each state and action separately
         state_enc = [self.encoders[k](v) for k, v in states.items()]
@@ -250,11 +263,11 @@ class WorldModel(nn.Module):
         x = self.input_proj(x)   # (batch, seq_len, d_model)
         return x
     
-    def encode_history(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor
-                       ) -> Tensor:
+    def encode_history(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor,
+                       grad: bool=False) -> Tensor:
         '''Encodes a history of states and actions into latents using the transformer.'''
         # combine all state and action embeddings into a single sequence of latents
-        x = self.embed_inputs(states, actions)   # (batch, seq_len, d_model)
+        x = self.embed_inputs(states, actions, grad=grad)
         x = self.input_norm(x).clone()
 
         # replace padded positions with learnable PAD embedding
@@ -294,8 +307,8 @@ class WorldModel(nn.Module):
                 raise ValueError(f'Invalid condition mode: {decoder.condition_mode}')
         return result_latents
 
-    def prepare_outputs(self, inputs: TensorDict, stochastic: bool=False,
-                        temperature: float=1.0) -> TensorDict:
+    def prepare_outputs(self, inputs: TensorDict, grad: bool=False, 
+                        stochastic: bool=False, temperature: float=1.0) -> TensorDict:
         '''Prepares outputs using the dataset statistics.'''
         if temperature <= 0:
             raise ValueError('temperature must be > 0.')
@@ -318,29 +331,31 @@ class WorldModel(nn.Module):
             
             # discrete outputs converted from one-hot vectors back to integer values
             elif spec.prange in ('int', 'bool'):
-                values = spec.values
-                assert values is not None and len(values) == 2
-                if spec.prange == 'bool':
-                    values = (0, 1)
-                low, high = int(values[0]), int(values[1])
-                if stochastic:
-                    probs = F.softmax(tensor.float() / temperature, dim=-1)
-                    flat_probs = probs.reshape(-1, probs.shape[-1])
-                    idx = torch.multinomial(flat_probs, num_samples=1).squeeze(-1)
-                    idx = idx.view(*probs.shape[:-1])
+                if grad:
+                    result[key] = F.softmax(tensor.float(), dim=-1)
                 else:
-                    idx = tensor.argmax(dim=-1)
-                assert idx.max() < (high - low + 1)
-                result[key] = idx + low
+                    if stochastic:
+                        probs = F.softmax(tensor.float() / temperature, dim=-1)
+                        flat_probs = probs.reshape(-1, probs.shape[-1])
+                        idx = torch.multinomial(flat_probs, num_samples=1).squeeze(-1)
+                        idx = idx.view(*probs.shape[:-1])
+                    else:
+                        idx = tensor.argmax(dim=-1)
+                    low, high = self.spec_bounds(key)
+                    assert idx.max() < (high - low + 1)
+                    result[key] = idx + low
+            
+            else:
+                raise ValueError(f'Unknown prange for key {key}: {spec.prange}')
 
         return result
     
     def forward(self, states: TensorDict, actions: TensorDict, pad_lens: Tensor,
                 return_latent: bool=False, decode_output: bool=False, 
-                **output_kwargs) -> TensorDict:
+                grad: bool=False, **output_kwargs) -> TensorDict:
         '''Predicts the next state or latent given a history of states and actions.'''
         # encode the history of states and actions into latents
-        latents = self.encode_history(states, actions, pad_lens)
+        latents = self.encode_history(states, actions, pad_lens, grad=grad)
         latents = self.select_condition(latents, pad_lens)
         if return_latent:
             return latents
@@ -348,7 +363,7 @@ class WorldModel(nn.Module):
         # decode the latents into next state predictions for each observed key
         next_states = {k: self.decoders[k](latents[k]) for k in self.env_spec.state_spec}
         if decode_output:
-            next_states = self.prepare_outputs(next_states, **output_kwargs)
+            next_states = self.prepare_outputs(next_states, grad=grad, **output_kwargs)
         return next_states
     
     # <---------------------------- training and evaluation ----------------------------->
@@ -515,7 +530,8 @@ class WorldModelEvaluator:
         padding = torch.zeros(batch, pad_len, *shape, device=self.device)
         return torch.cat([x, padding], dim=1)
 
-    def reset(self, init_states: TensorDict, init_actions: Optional[TensorDict]) -> None:
+    def reset(self, init_states: TensorDict, init_actions: Optional[TensorDict],
+              grad: bool=False) -> None:
         '''Resets the rollout context with initial states and actions.'''
         spec = self.model.env_spec
         
@@ -524,21 +540,33 @@ class WorldModelEvaluator:
         assert init_len >= 1, 'reset requires at least one initial timestep.'
         self.pad_len = max(self.seq_len - init_len, 0)
 
-        # extract only the observed states, pad to required length and store in buffer
-        self.states = {k: self.pad_with_zeros(init_states[k]) for k in spec.state_spec}
+        # extract only the observed states, pad to required length and store in buffer;
+        # in grad mode, discrete states are stored as one-hot floats rather than integers
+        self.states = {
+            k: self.pad_with_zeros(
+                self.model.one_hot(init_states[k], k) if grad else init_states[k]) 
+            for k in spec.state_spec
+        }
 
         # pad initial actions to required sequence length and store in context buffer
         if init_actions is None:
             assert init_len == 1, 'Must pass single initial state.'
-            self.actions = {
-                k: torch.zeros(self.batch, self.seq_len, *spec.shape, device=self.device)
-                for k, spec in spec.action_spec.items()
-            }
+            self.actions = {}
+            for key, spec in spec.action_spec.items():
+                if grad and spec.prange in ('int', 'bool'):
+                    low, high = self.model.spec_bounds(key)
+                    n_classes = high - low + 1
+                    shape = (self.batch, self.seq_len, *spec.shape, n_classes)
+                else:
+                    shape = (self.batch, self.seq_len, *spec.shape)
+                self.actions[key] = torch.zeros(*shape, device=self.device)
         else:
             self.actions = {
-                k: self.pad_with_zeros(init_actions[k]) for k in spec.action_spec
+                k: self.pad_with_zeros(
+                    self.model.one_hot(init_actions[k], k) if grad else init_actions[k])
+                for k in spec.action_spec
             }
-
+        
     def index_of_last_epoch(self) -> int:
         '''Calculates the index into the last real state, accounting for padding.'''
         return max(self.seq_len - self.pad_len - 1, 0)
@@ -556,8 +584,7 @@ class WorldModelEvaluator:
             result[key] = value
         return result
     
-    def step(self, actions: TensorDict, differentiable: bool=False, **output_kwargs
-             ) -> TensorDict:
+    def step(self, actions: TensorDict, grad: bool=False, **output_kwargs) -> TensorDict:
         '''Performs a rollout step by feeding the current context into the model to 
         predict the next state, then updating with the new state and action.'''
         self.model.eval()
@@ -571,9 +598,10 @@ class WorldModelEvaluator:
 
         # predict next state using the model
         pad_lens = torch.full((self.batch,), self.pad_len, device=self.device)
-        with (torch.enable_grad() if differentiable else torch.no_grad()):
+        with (torch.enable_grad() if grad else torch.no_grad()):
             next_states = self.model.forward(
-                self.states, self.actions, pad_lens, decode_output=True, **output_kwargs)
+                self.states, self.actions, pad_lens, decode_output=True, 
+                grad=grad, **output_kwargs)
         assert isinstance(next_states, dict), 'Model output must be a dict.'
 
         # if there is no padding, roll the state and action buffers
@@ -596,17 +624,17 @@ class WorldModelEvaluator:
         return next_states
     
     def rollout(self, init_states: TensorDict, init_actions: Optional[TensorDict], 
-                policy, max_steps: int, differentiable: bool=False, **output_kwargs
-                ) -> TensorDict:
+                policy, max_steps: int, grad: bool=False, **output_kwargs) -> TensorDict:
         '''Performs a rollout using the world model and a given policy.'''
-        self.reset(init_states, init_actions)
+        self.reset(init_states, init_actions, grad=grad)
         
         trajectories = {}
         for _ in tqdm(range(max_steps), desc='Rollout'):
             actions = policy(self.last_states())
-            next_states = self.step(actions, differentiable=differentiable, **output_kwargs)
+            next_states = self.step(actions, grad=grad, **output_kwargs)
             for key, tensor in next_states.items():
-                tensor = tensor if differentiable else tensor.detach().cpu()
+                if not grad:
+                    tensor = tensor.detach().cpu()
                 trajectories.setdefault(key, []).append(tensor)
                 
         return {k: torch.stack(vs, dim=1) for k, vs in trajectories.items()}
